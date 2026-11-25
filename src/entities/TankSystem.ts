@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { AudioEngine } from '../engine/AudioEngine';
+import { getDifficultyConfig } from '../engine/DifficultyConfig';
 import { getProceduralTextures } from '../engine/Textures';
+import { DifficultyModifier } from '../types';
 import { CoverSystem, TankHullCollider } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
 import { ProjectileSystem } from './ProjectileSystem';
@@ -312,7 +314,9 @@ export class TankSystem {
     playerPos: THREE.Vector3,
     playerEyeY: number,
     playerExposure: number,
-    onExplosion: (center: THREE.Vector3, radius: number, maxDmg: number, craterR: number, craterD: number, cause: string) => void
+    onExplosion: (center: THREE.Vector3, radius: number, maxDmg: number, craterR: number, craterD: number, cause: string) => void,
+    peekDanger = 0,
+    diffConfig: DifficultyModifier = getDifficultyConfig('veteran')
   ): void {
     const playerHead = new THREE.Vector3(playerPos.x, playerEyeY, playerPos.z);
 
@@ -404,14 +408,14 @@ export class TankSystem {
       if (t.cannonCooldown <= 0 && distPlayer < 65) {
         t.cannonCooldown = t.heavy ? 5.2 : 6.0;
         const aimOrigin = muzzlePos.clone();
-        const target =
-          playerExposure > 0.35
-            ? playerHead.clone()
-            : new THREE.Vector3(
-                playerPos.x + (Math.random() - 0.5) * 4,
-                Math.max(0, playerPos.y + 0.8),
-                playerPos.z - 1.2
-              );
+        const aimDirectly = playerExposure > 0.6 || (playerExposure > 0.3 && peekDanger >= 0.6);
+        const target = aimDirectly
+          ? playerHead.clone()
+          : new THREE.Vector3(
+              playerPos.x + (Math.random() * 2 - 1) * 2.2,
+              Math.max(0, playerPos.y + 0.9),
+              playerPos.z - 1.3
+            );
         const dir = target.sub(aimOrigin).normalize();
         const hit = this.cover.raycastWorld(aimOrigin, dir, 65, true);
         const expPoint = hit ? hit.point : aimOrigin.clone().addScaledVector(dir, 30);
@@ -424,11 +428,13 @@ export class TankSystem {
 
       // Coaxial MG bursts when player is exposed
       t.mgCooldown -= dt;
-      if (playerExposure > 0.4 && t.mgCooldown <= 0 && distPlayer < 55) {
+      if (playerExposure > 0.28 && t.mgCooldown <= 0 && distPlayer < 55) {
         if (this.cover.hasLineOfSight(muzzlePos, playerHead)) {
           t.mgCooldown = 0.11;
           const dir = playerHead.clone().sub(muzzlePos).normalize();
-          const spread = playerExposure > 0.7 ? 0.032 : 0.075;
+          const spread =
+            THREE.MathUtils.lerp(0.11, playerExposure > 0.65 ? 0.028 : 0.055, peekDanger) *
+            diffConfig.enemySpreadMult;
           dir.x += (Math.random() - 0.5) * spread;
           dir.y += (Math.random() - 0.5) * spread;
           dir.normalize();

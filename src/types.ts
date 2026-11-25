@@ -5,7 +5,32 @@ export type CoverState = 'dugout' | 'sheltered' | 'peeking' | 'exposed';
 export type SoldierRole = 'rifleman' | 'assault' | 'grenadier' | 'mg_gunner' | 'officer';
 export type MissionId = 0 | 1 | 2 | 3;
 export type QualityLevel = 'low' | 'medium' | 'high';
+export type DifficultyLevel = 'recruit' | 'veteran' | 'infernal';
 export type GameScreen = 'menu' | 'briefing' | 'playing' | 'paused' | 'kia' | 'victory';
+
+export interface DifficultyModifier {
+  id: DifficultyLevel;
+  label: string;
+  description: string;
+  enemyDamageMult: number;
+  enemySpreadMult: number;
+  bleedChanceMult: number;
+  waveCountMult: number;
+  peekLockTime: number;
+  openLockTime: number;
+  allowCheckpoints: boolean;
+  regenCapHp: number;
+  regenDelaySec: number;
+  regenRatePerSec: number;
+}
+
+export interface PlayerCheckpointSnapshot {
+  hp: number;
+  bandages: number;
+  weaponId: WeaponId;
+  magAmmo: Record<WeaponId, number>;
+  reserveAmmo: Record<WeaponId, number>;
+}
 
 export interface TrenchSegment {
   id: string;
@@ -229,12 +254,19 @@ export interface HUDState {
   hitMarkerCrit: boolean;
   spreadPx: number;
   showControlsHint: boolean;
+  peekDanger: number;
+  isRegenerating: boolean;
+  difficulty: DifficultyLevel;
+  phaseIndex: number;
+  totalPhases: number;
+  checkpointToast: string | null;
 }
 
 export interface GameSettings {
   mouseSensitivity: number;
   masterVolume: number;
   quality: QualityLevel;
+  difficulty: DifficultyLevel;
 }
 
 export interface RaycastHit {
@@ -256,4 +288,7 @@ export interface MissionEndSummary {
   tanksDestroyed: number;
   shotsFired: number;
   shotsHit: number;
+  difficulty: DifficultyLevel;
+  canRetryCheckpoint: boolean;
+  checkpointPhaseLabel: string | null;
 }

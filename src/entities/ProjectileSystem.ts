@@ -236,7 +236,8 @@ export class ProjectileSystem {
     dt: number,
     playerPos: THREE.Vector3,
     playerEyeY: number,
-    callbacks: ImpactCallbacks
+    callbacks: ImpactCallbacks,
+    bleedChanceMult = 1.0
   ): void {
     const playerHead = new THREE.Vector3(playerPos.x, playerEyeY, playerPos.z);
 
@@ -283,8 +284,13 @@ export class ProjectileSystem {
           // Enemy bullet hitting player
           const playerHitDist = Math.hypot(samplePos.x - playerPos.x, samplePos.z - playerPos.z);
           const groundY = playerPos.y;
-          if (playerHitDist < 0.44 && samplePos.y >= groundY + 0.15 && samplePos.y <= playerEyeY + 0.18) {
-            callbacks.onHitPlayer(t.damage, t.pos, 'Fogo cruzado inimigo sem cobertura', Math.random() < 0.35);
+          if (playerHitDist < 0.38 && samplePos.y >= groundY + 0.15 && samplePos.y <= playerEyeY + 0.18) {
+            callbacks.onHitPlayer(
+              t.damage,
+              t.pos,
+              'Fogo cruzado inimigo sem cobertura',
+              Math.random() < 0.24 * bleedChanceMult
+            );
             consumed = true;
             break;
           }

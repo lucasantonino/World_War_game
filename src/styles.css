@@ -157,6 +157,52 @@ button {
   min-width: 82px;
 }
 
+.difficulty-selector {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.diff-btn {
+  font-family: var(--font-display);
+  font-size: 0.92rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 8px 12px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  transition: border-color 0.14s ease, background-color 0.14s ease, color 0.14s ease;
+}
+
+.diff-btn:hover {
+  border-color: var(--border-strong);
+  background: rgba(34, 37, 31, 0.94);
+  color: var(--text-primary);
+}
+
+.diff-btn.active {
+  border-color: var(--accent-amber);
+  background: rgba(46, 42, 30, 0.94);
+  color: var(--accent-amber);
+  box-shadow: 0 0 12px rgba(212, 155, 56, 0.2);
+}
+
+.diff-desc {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  padding: 8px 11px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  margin-bottom: 18px;
+  min-height: 44px;
+}
+
 .cta-row {
   display: flex;
   flex-wrap: wrap;
@@ -602,6 +648,15 @@ button {
   border-radius: 4px;
 }
 
+.objective-phase-meta {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--accent-amber);
+  margin-bottom: 2px;
+}
+
 .objective-main {
   font-family: var(--font-display);
   font-size: 0.96rem;
@@ -615,6 +670,20 @@ button {
   font-size: 0.74rem;
   color: var(--text-secondary);
   margin-top: 2px;
+}
+
+.checkpoint-toast {
+  padding: 5px 14px;
+  background: var(--panel-bg);
+  border: 1px solid var(--accent-safe);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #9cd48f;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
 .air-raid-banner {
@@ -860,6 +929,51 @@ button {
   color: var(--text-secondary);
 }
 
+.peek-danger-box {
+  padding: 6px 10px;
+  background: var(--panel-bg);
+  border: 1px solid rgba(212, 155, 56, 0.4);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.peek-danger-box.danger {
+  border-color: rgba(239, 83, 67, 0.75);
+  background: rgba(74, 18, 14, 0.86);
+}
+
+.peek-danger-header {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--accent-amber);
+}
+
+.peek-danger-box.danger .peek-danger-header {
+  color: #ff9e94;
+}
+
+.peek-danger-track {
+  width: 100%;
+  height: 5px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.peek-danger-fill {
+  height: 100%;
+  background: var(--accent-amber);
+  transition: width 0.08s linear, background-color 0.12s ease;
+}
+
+.peek-danger-fill.danger {
+  background: var(--accent-danger-bright);
+}
+
 .vitals-box {
   padding: 10px 12px;
   background: rgba(14, 16, 14, 0.76);
@@ -912,6 +1026,16 @@ button {
   color: var(--text-secondary);
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.regen-tag {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--accent-safe);
 }
 
 /* Bottom Right: Weapon & Ammo */

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { AudioEngine } from '../engine/AudioEngine';
-import { EmplacementSpec, SoldierRole } from '../types';
+import { getDifficultyConfig } from '../engine/DifficultyConfig';
+import { DifficultyModifier, EmplacementSpec, SoldierRole } from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
 import { ProjectileSystem } from './ProjectileSystem';
@@ -280,9 +281,27 @@ export class SoldierSystem {
     playerEyeY: number,
     playerExposure: number,
     airRaidActive: boolean,
-    onRadioShout: (msg: string) => void
+    onRadioShout: (msg: string) => void,
+    peekDanger = 0,
+    diffConfig: DifficultyModifier = getDifficultyConfig('veteran')
   ): void {
     const playerHead = new THREE.Vector3(playerPos.x, playerEyeY, playerPos.z);
+
+    // Limit direct player-focusing enemies to the 6 closest within < 58m
+    const enemyCandidates: Array<{ id: number; dist: number }> = [];
+    for (const s of this.soldiers) {
+      if (s.alive && s.faction === 'enemy') {
+        const dist = s.pos.distanceTo(playerPos);
+        if (dist < 58) {
+          enemyCandidates.push({ id: s.id, dist });
+        }
+      }
+    }
+    enemyCandidates.sort((a, b) => a.dist - b.dist);
+    const directPlayerShooters = new Set<number>();
+    for (let i = 0; i < Math.min(6, enemyCandidates.length); i++) {
+      directPlayerShooters.add(enemyCandidates[i].id);
+    }
 
     for (let i = this.soldiers.length - 1; i >= 0; i--) {
       const s = this.soldiers[i];
@@ -302,7 +321,17 @@ export class SoldierSystem {
       if (s.faction === 'ally') {
         this.updateAlly(s, dt, airRaidActive);
       } else {
-        this.updateEnemy(s, dt, playerPos, playerHead, playerExposure, onRadioShout);
+        this.updateEnemy(
+          s,
+          dt,
+          playerPos,
+          playerHead,
+          playerExposure,
+          onRadioShout,
+          peekDanger,
+          diffConfig,
+          directPlayerShooters.has(s.id)
+        );
       }
     }
   }
@@ -352,13 +381,16 @@ export class SoldierSystem {
     playerPos: THREE.Vector3,
     playerHead: THREE.Vector3,
     playerExposure: number,
-    onRadioShout: (msg: string) => void
+    onRadioShout: (msg: string) => void,
+    peekDanger: number,
+    diffConfig: DifficultyModifier,
+    canFocusPlayer: boolean
   ): void {
     const enemyEye = new THREE.Vector3(s.pos.x, s.pos.y + 1.32, s.pos.z);
     const distToPlayer = s.pos.distanceTo(playerPos);
     const canSeePlayer =
       distToPlayer < 58 &&
-      playerExposure > 0.28 &&
+      playerExposure >= 0.2 &&
       this.cover.hasLineOfSight(enemyEye, playerHead);
 
     // Movement (non-emplaced)
@@ -386,8 +418,10 @@ export class SoldierSystem {
       }
     }
 
+    const spreadMult = diffConfig.enemySpreadMult;
+
     // Aiming & Combat
-    if (canSeePlayer) {
+    if (canSeePlayer && canFocusPlayer) {
       const dx = playerPos.x - s.pos.x;
       const dz = playerPos.z - s.pos.z;
       s.yaw = Math.atan2(-dx, -dz);
@@ -411,42 +445,49 @@ export class SoldierSystem {
         }
       }
 
-      // First burst grace gives 0.35s warning crack before deadly focus when exposed
+      // First burst grace gives warning before deadly focus when exposed
       s.fireCooldown -= dt;
       if (s.fireCooldown <= 0) {
-        if (s.role === 'mg_gunner') {
-          s.fireCooldown = 0.11;
-        } else if (s.role === 'assault') {
-          s.fireCooldown = 0.16;
-        } else {
-          s.fireCooldown = 0.95 + Math.random() * 0.65;
-        }
+        s.fireCooldown = this.getEnemyFireCooldown(s.role);
 
         const dir = new THREE.Vector3().subVectors(playerHead, enemyEye).normalize();
-        // Exposed player gets laser-focused after warning; sheltered player receives suppressive spread
-        const accuracyError =
-          playerExposure > 0.65 && s.firstShotGrace <= 0
-            ? 0.025
-            : playerExposure > 0.38
-              ? 0.065
-              : 0.13;
+        let accuracyError =
+          playerExposure <= 0.6
+            ? THREE.MathUtils.lerp(0.135, 0.036, peekDanger) * spreadMult
+            : THREE.MathUtils.lerp(0.068, 0.022, peekDanger) * spreadMult;
+        if (s.firstShotGrace > 0) {
+          accuracyError += 0.06;
+        }
         s.firstShotGrace = Math.max(0, s.firstShotGrace - 0.18);
 
-        dir.x += (Math.random() - 0.5) * accuracyError;
-        dir.y += (Math.random() - 0.5) * accuracyError;
-        dir.z += (Math.random() - 0.5) * accuracyError;
-        dir.normalize();
+        this.fireEnemyShot(s, enemyEye, dir, accuracyError, playerPos.x, distToPlayer);
+      }
+    } else if (canSeePlayer) {
+      // Non-focusing enemies fire high suppressive shots over the parapet or engage allies
+      s.firstShotGrace = 0.35;
+      const targetAlly = Math.random() < 0.55 ? this.findRandomLivingAlly() : null;
+      const aimTarget = targetAlly
+        ? new THREE.Vector3(targetAlly.pos.x, targetAlly.pos.y + 1.0, targetAlly.pos.z)
+        : new THREE.Vector3(
+            playerPos.x + (Math.random() - 0.5) * 3.5,
+            Math.max(playerHead.y + 0.65, playerPos.y + 1.45),
+            playerPos.z - 0.6
+          );
 
-        const dmg = s.role === 'mg_gunner' ? 18 : s.role === 'rifleman' ? 24 : 15;
-        this.projectiles.spawnBullet(enemyEye, dir, 118, dmg, 'enemy');
+      const dx = aimTarget.x - s.pos.x;
+      const dz = aimTarget.z - s.pos.z;
+      s.yaw = Math.atan2(-dx, -dz);
+      s.group.rotation.y = s.yaw;
 
-        const pan = Math.max(-1, Math.min(1, (s.pos.x - playerPos.x) / 28));
-        if (Math.random() < 0.45) {
-          this.audio.playGunshot(s.role === 'mg_gunner' ? 'mg' : 'rifle', distToPlayer, pan);
-        }
+      s.fireCooldown -= dt;
+      if (s.fireCooldown <= 0) {
+        s.fireCooldown =
+          s.role === 'mg_gunner' ? 0.18 : s.role === 'assault' ? 0.24 : 1.15 + Math.random() * 0.7;
+        const dir = new THREE.Vector3().subVectors(aimTarget, enemyEye).normalize();
+        this.fireEnemyShot(s, enemyEye, dir, 0.16 * spreadMult, playerPos.x, distToPlayer);
       }
     } else {
-      // Face toward ally trench and occasionally suppress allies
+      // Face toward ally trench and suppress allies or parapet
       s.yaw = Math.PI;
       s.group.rotation.y = s.yaw;
       s.firstShotGrace = 0.35;
@@ -466,8 +507,48 @@ export class SoldierSystem {
           dir.y += (Math.random() - 0.5) * 0.09;
           dir.normalize();
           this.projectiles.spawnBullet(enemyEye, dir, 112, 16, 'enemy');
+        } else if (distToPlayer < 58) {
+          const parapetTarget = new THREE.Vector3(
+            playerPos.x + (Math.random() - 0.5) * 5.0,
+            Math.max(playerHead.y + 0.8, playerPos.y + 1.55),
+            playerPos.z - 0.6
+          );
+          const dir = new THREE.Vector3().subVectors(parapetTarget, enemyEye).normalize();
+          const suppressSpread = 0.16 * spreadMult;
+          dir.x += (Math.random() - 0.5) * suppressSpread;
+          dir.y += (Math.random() - 0.5) * suppressSpread;
+          dir.normalize();
+          this.projectiles.spawnBullet(enemyEye, dir, 112, 16, 'enemy');
         }
       }
+    }
+  }
+
+  private getEnemyFireCooldown(role: SoldierRole): number {
+    if (role === 'mg_gunner') return 0.11;
+    if (role === 'assault') return 0.16;
+    return 0.95 + Math.random() * 0.65;
+  }
+
+  private fireEnemyShot(
+    s: Soldier,
+    enemyEye: THREE.Vector3,
+    dir: THREE.Vector3,
+    accuracyError: number,
+    playerX: number,
+    distToPlayer: number
+  ): void {
+    dir.x += (Math.random() - 0.5) * accuracyError;
+    dir.y += (Math.random() - 0.5) * accuracyError;
+    dir.z += (Math.random() - 0.5) * accuracyError;
+    dir.normalize();
+
+    const dmg = s.role === 'mg_gunner' ? 18 : s.role === 'rifleman' ? 24 : 15;
+    this.projectiles.spawnBullet(enemyEye, dir, 118, dmg, 'enemy');
+
+    const pan = Math.max(-1, Math.min(1, (s.pos.x - playerX) / 28));
+    if (Math.random() < 0.45) {
+      this.audio.playGunshot(s.role === 'mg_gunner' ? 'mg' : 'rifle', distToPlayer, pan);
     }
   }
 

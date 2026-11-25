@@ -1,4 +1,5 @@
 import {
+  DifficultyLevel,
   GameScreen,
   GameSettings,
   HUDState,
@@ -6,6 +7,7 @@ import {
   MissionEndSummary,
   MissionId
 } from '../types';
+import { DIFFICULTY_CONFIGS } from '../engine/DifficultyConfig';
 import { WEAPON_STATS } from '../entities/PlayerController';
 import { MISSIONS } from '../world/MissionData';
 
@@ -15,6 +17,7 @@ export interface UICallbacks {
   onEnterBattle: () => void;
   onResumeBattle: () => void;
   onRestartMission: () => void;
+  onRetryCheckpoint: () => void;
   onReturnToMenu: () => void;
   onNextMission: () => void;
   onSettingsChanged: (settings: GameSettings) => void;
@@ -49,8 +52,10 @@ export class UIManager {
   private damageArcsEl!: HTMLElement;
   private compassStrip!: HTMLElement;
   private compassObjMarker!: HTMLElement;
+  private objPhaseEl!: HTMLElement;
   private objMainEl!: HTMLElement;
   private objSubEl!: HTMLElement;
+  private checkpointToastEl!: HTMLElement;
   private airRaidEl!: HTMLElement;
   private radioEl!: HTMLElement;
   private reticleEl!: HTMLElement;
@@ -67,15 +72,26 @@ export class UIManager {
   private coverPillEl!: HTMLElement;
   private coverTextEl!: HTMLElement;
   private postureTextEl!: HTMLElement;
+  private peekBarEl!: HTMLElement;
+  private peekLabelEl!: HTMLElement;
+  private peekFillEl!: HTMLElement;
   private hpNumEl!: HTMLElement;
   private bleedTagEl!: HTMLElement;
   private hpFillEl!: HTMLElement;
   private bandagesEl!: HTMLElement;
+  private regenTagEl!: HTMLElement;
   private weaponNameEl!: HTMLElement;
   private ammoReadoutEl!: HTMLElement;
   private extraAmmoEl!: HTMLElement;
   private slotEls: HTMLElement[] = [];
   private controlsToastEl!: HTMLElement;
+
+  // Menu & Pause / End refs
+  private diffBtns: HTMLButtonElement[] = [];
+  private diffDescEl!: HTMLElement;
+  private pauseDiffSelect!: HTMLSelectElement;
+  private endRetryBtn!: HTMLButtonElement;
+  private endCheckpointBtn!: HTMLButtonElement;
 
   constructor(
     root: HTMLElement,
@@ -136,6 +152,8 @@ export class UIManager {
       subEl.textContent = `${summary.missionTitle} — Linha assegurada`;
       causeBox.classList.add('hidden');
       nextBtn.classList.toggle('hidden', summary.missionId >= 3);
+      this.endCheckpointBtn.classList.add('hidden');
+      this.endRetryBtn.className = 'btn-secondary';
     } else {
       titleEl.textContent = 'BAIXA EM COMBATE';
       titleEl.setAttribute('style', 'color: #ef5343');
@@ -144,6 +162,15 @@ export class UIManager {
       causeEl.textContent = summary.causeOfDeath;
       adviceEl.textContent = summary.tacticalAdvice;
       nextBtn.classList.add('hidden');
+
+      if (summary.canRetryCheckpoint) {
+        this.endCheckpointBtn.textContent = `Voltar ao Checkpoint (${summary.checkpointPhaseLabel ?? 'Fase'})`;
+        this.endCheckpointBtn.classList.remove('hidden');
+        this.endRetryBtn.className = 'btn-secondary';
+      } else {
+        this.endCheckpointBtn.classList.add('hidden');
+        this.endRetryBtn.className = 'btn-primary';
+      }
     }
 
     const mins = Math.floor(summary.durationSeconds / 60);
@@ -206,11 +233,21 @@ export class UIManager {
       this.compassObjMarker.classList.add('hidden');
     }
 
-    // 4. Objective & Alerts
+    // 4. Objective, Phase Badge, Checkpoint Toast & Alerts
+    const totalPhases = Math.max(1, state.totalPhases);
+    const diffLabel = DIFFICULTY_CONFIGS[state.difficulty].label.toUpperCase();
+    this.objPhaseEl.textContent = `FASE ${state.phaseIndex + 1}/${totalPhases} • ${diffLabel}`;
     this.objMainEl.textContent = state.objectiveText;
     const distTag =
       state.objectiveDistance !== null ? ` • ${Math.round(state.objectiveDistance)}m` : '';
     this.objSubEl.textContent = `${state.objectiveSubtext}${distTag}`;
+
+    if (state.checkpointToast) {
+      this.checkpointToastEl.textContent = state.checkpointToast;
+      this.checkpointToastEl.classList.remove('hidden');
+    } else {
+      this.checkpointToastEl.classList.add('hidden');
+    }
 
     if (state.airRaidAlert) {
       this.airRaidEl.textContent = state.airRaidAlert;
@@ -269,7 +306,7 @@ export class UIManager {
       this.grenadeWarnEl.classList.add('hidden');
     }
 
-    // 7. Cover & Vitals
+    // 7. Cover, Peek Danger & Vitals
     this.coverPillEl.className = `cover-pill ${state.coverState}`;
     this.coverTextEl.textContent = COVER_LABELS[state.coverState];
     this.postureTextEl.textContent = state.mgMounted
@@ -280,12 +317,25 @@ export class UIManager {
           ? 'CORRENDO'
           : 'EM PÉ';
 
+    if (state.peekDanger > 0.12) {
+      const peekPct = Math.min(100, Math.round(state.peekDanger * 100));
+      const isCritical = peekPct > 65;
+      this.peekBarEl.classList.remove('hidden');
+      this.peekBarEl.classList.toggle('danger', isCritical);
+      this.peekLabelEl.textContent = `MIRA INIMIGA: ${peekPct}%`;
+      this.peekFillEl.style.width = `${peekPct}%`;
+      this.peekFillEl.classList.toggle('danger', isCritical);
+    } else {
+      this.peekBarEl.classList.add('hidden');
+    }
+
     const hpInt = Math.max(0, Math.ceil(state.hp));
     this.hpNumEl.textContent = `${hpInt}`;
     this.hpFillEl.style.width = `${hpInt}%`;
     this.hpFillEl.classList.toggle('low', hpInt < 38 || state.bleeding);
     this.bleedTagEl.textContent = state.bleeding ? 'SANGRANDO — SEGURE [H]' : '';
     this.bandagesEl.textContent = `CURATIVOS [H]: ${state.bandages}`;
+    this.regenTagEl.textContent = state.isRegenerating ? '+REGEN' : '';
 
     // 8. Weapon & Ammo
     if (state.mgMounted) {
@@ -328,6 +378,17 @@ export class UIManager {
               <div class="survival-rule-row"><span class="rule-tag">ANTITANQUE</span><span>Fuzis ricocheteiam em blindados — use a <b>Bazuca [3]</b> nos flancos ou traseira.</span></div>
               <div class="survival-rule-row"><span class="rule-tag">HEMORRAGIA</span><span>Ferimentos graves sangram até a morte. Segure <b>[H]</b> protegido para estancar.</span></div>
             </div>
+            <div class="difficulty-selector" role="group" aria-label="Selecionar dificuldade">
+              ${(['recruit', 'veteran', 'infernal'] as DifficultyLevel[])
+                .map(
+                  (id) => `
+                  <button type="button" class="diff-btn ${this.settings.difficulty === id ? 'active' : ''}" data-diff="${id}">
+                    ${DIFFICULTY_CONFIGS[id].label}
+                  </button>`
+                )
+                .join('')}
+            </div>
+            <div id="menu-diff-desc" class="diff-desc">${DIFFICULTY_CONFIGS[this.settings.difficulty].description}</div>
             <div class="cta-row">
               <button id="btn-start-campaign" class="btn-primary">Iniciar Operação</button>
               <button id="btn-open-settings-menu" class="btn-secondary">Configurações</button>
@@ -389,6 +450,14 @@ export class UIManager {
                 <option value="high" ${this.settings.quality === 'high' ? 'selected' : ''}>Alta</option>
               </select>
             </div>
+            <div class="setting-row">
+              <label for="set-diff">Dificuldade</label>
+              <select id="set-diff">
+                <option value="recruit" ${this.settings.difficulty === 'recruit' ? 'selected' : ''}>Recruta</option>
+                <option value="veteran" ${this.settings.difficulty === 'veteran' ? 'selected' : ''}>Veterano</option>
+                <option value="infernal" ${this.settings.difficulty === 'infernal' ? 'selected' : ''}>Infernal</option>
+              </select>
+            </div>
           </div>
           <div class="controls-grid">
             <div class="control-pair"><span>Mover / Correr</span><span><kbd>WASD</kbd> <kbd>Shift</kbd></span></div>
@@ -429,6 +498,7 @@ export class UIManager {
             <button id="btn-end-menu" class="btn-secondary">Voltar ao QG</button>
             <div style="display:flex;gap:10px">
               <button id="btn-end-retry" class="btn-secondary">Tentar Novamente</button>
+              <button id="btn-end-checkpoint" class="btn-primary hidden">Voltar ao Checkpoint</button>
               <button id="btn-end-next" class="btn-primary hidden">Próxima Operação</button>
             </div>
           </div>
@@ -454,9 +524,11 @@ export class UIManager {
             <div class="compass-needle"></div>
           </div>
           <div class="objective-banner">
+            <div id="hud-obj-phase" class="objective-phase-meta">FASE 1/1 • VETERANO</div>
             <div id="hud-obj-main" class="objective-main">OBJETIVO</div>
             <div id="hud-obj-sub" class="objective-sub">...</div>
           </div>
+          <div id="hud-checkpoint-toast" class="checkpoint-toast hidden"></div>
           <div id="hud-air-raid" class="air-raid-banner hidden">ALERTA AÉREO</div>
         </div>
 
@@ -483,6 +555,12 @@ export class UIManager {
             <span id="hud-cover-text" class="cover-text">EM COBERTURA</span>
             <span id="hud-posture-text" class="posture-sub">EM PÉ</span>
           </div>
+          <div id="hud-peek-bar" class="peek-danger-box hidden">
+            <div class="peek-danger-header">
+              <span id="hud-peek-label">MIRA INIMIGA: 0%</span>
+            </div>
+            <div class="peek-danger-track"><div id="hud-peek-fill" class="peek-danger-fill" style="width:0%"></div></div>
+          </div>
           <div class="vitals-box tabular">
             <div class="vitals-row">
               <span id="hud-hp-num" class="hp-num">100</span>
@@ -491,6 +569,7 @@ export class UIManager {
             <div class="hp-track"><div id="hud-hp-fill" class="hp-fill" style="width:100%"></div></div>
             <div class="bandage-row">
               <span id="hud-bandages">CURATIVOS [H]: 3</span>
+              <span id="hud-regen-tag" class="regen-tag"></span>
             </div>
           </div>
         </div>
@@ -525,8 +604,10 @@ export class UIManager {
     this.damageArcsEl = this.root.querySelector('#damage-arcs')!;
     this.compassStrip = this.root.querySelector('#compass-strip')!;
     this.compassObjMarker = this.root.querySelector('#compass-obj')!;
+    this.objPhaseEl = this.root.querySelector('#hud-obj-phase')!;
     this.objMainEl = this.root.querySelector('#hud-obj-main')!;
     this.objSubEl = this.root.querySelector('#hud-obj-sub')!;
+    this.checkpointToastEl = this.root.querySelector('#hud-checkpoint-toast')!;
     this.airRaidEl = this.root.querySelector('#hud-air-raid')!;
     this.radioEl = this.root.querySelector('#hud-radio')!;
     this.reticleEl = this.root.querySelector('#hud-reticle')!;
@@ -543,15 +624,25 @@ export class UIManager {
     this.coverPillEl = this.root.querySelector('#hud-cover-pill')!;
     this.coverTextEl = this.root.querySelector('#hud-cover-text')!;
     this.postureTextEl = this.root.querySelector('#hud-posture-text')!;
+    this.peekBarEl = this.root.querySelector('#hud-peek-bar')!;
+    this.peekLabelEl = this.root.querySelector('#hud-peek-label')!;
+    this.peekFillEl = this.root.querySelector('#hud-peek-fill')!;
     this.hpNumEl = this.root.querySelector('#hud-hp-num')!;
     this.bleedTagEl = this.root.querySelector('#hud-bleed-tag')!;
     this.hpFillEl = this.root.querySelector('#hud-hp-fill')!;
     this.bandagesEl = this.root.querySelector('#hud-bandages')!;
+    this.regenTagEl = this.root.querySelector('#hud-regen-tag')!;
     this.weaponNameEl = this.root.querySelector('#hud-weapon-name')!;
     this.ammoReadoutEl = this.root.querySelector('#hud-ammo-readout')!;
     this.extraAmmoEl = this.root.querySelector('#hud-extra-ammo')!;
     this.slotEls = Array.from(this.root.querySelectorAll('.slot-chip'));
     this.controlsToastEl = this.root.querySelector('#controls-toast')!;
+
+    this.diffBtns = Array.from(this.root.querySelectorAll('.diff-btn')) as HTMLButtonElement[];
+    this.diffDescEl = this.root.querySelector('#menu-diff-desc')!;
+    this.pauseDiffSelect = this.root.querySelector('#set-diff') as HTMLSelectElement;
+    this.endRetryBtn = this.root.querySelector('#btn-end-retry') as HTMLButtonElement;
+    this.endCheckpointBtn = this.root.querySelector('#btn-end-checkpoint') as HTMLButtonElement;
 
     this.renderOperationsList();
     this.bindButtonEvents();
@@ -608,6 +699,14 @@ export class UIManager {
     this.compassStrip.innerHTML = items.join('');
   }
 
+  private syncDifficultyUI(diff: DifficultyLevel): void {
+    for (const btn of this.diffBtns) {
+      btn.classList.toggle('active', btn.dataset.diff === diff);
+    }
+    this.diffDescEl.textContent = DIFFICULTY_CONFIGS[diff].description;
+    this.pauseDiffSelect.value = diff;
+  }
+
   private bindButtonEvents(): void {
     this.root.querySelector('#btn-start-campaign')!.addEventListener('click', () => {
       this.callbacks.onStartMissionBriefing();
@@ -633,28 +732,45 @@ export class UIManager {
     this.root.querySelector('#btn-end-menu')!.addEventListener('click', () => {
       this.callbacks.onReturnToMenu();
     });
-    this.root.querySelector('#btn-end-retry')!.addEventListener('click', () => {
+    this.endRetryBtn.addEventListener('click', () => {
       this.callbacks.onRestartMission();
+    });
+    this.endCheckpointBtn.addEventListener('click', () => {
+      this.callbacks.onRetryCheckpoint();
     });
     this.root.querySelector('#btn-end-next')!.addEventListener('click', () => {
       this.callbacks.onNextMission();
     });
+
+    for (const btn of this.diffBtns) {
+      btn.addEventListener('click', () => {
+        const diff = btn.dataset.diff as DifficultyLevel;
+        if (!diff || !(diff in DIFFICULTY_CONFIGS)) return;
+        this.settings = { ...this.settings, difficulty: diff };
+        this.syncDifficultyUI(diff);
+        this.callbacks.onSettingsChanged(this.settings);
+      });
+    }
 
     const sensInput = this.root.querySelector('#set-sens') as HTMLInputElement;
     const volInput = this.root.querySelector('#set-vol') as HTMLInputElement;
     const qualSelect = this.root.querySelector('#set-qual') as HTMLSelectElement;
 
     const emitSettings = () => {
+      const diff = this.pauseDiffSelect.value as DifficultyLevel;
       this.settings = {
         mouseSensitivity: parseFloat(sensInput.value),
         masterVolume: parseFloat(volInput.value),
-        quality: qualSelect.value as GameSettings['quality']
+        quality: qualSelect.value as GameSettings['quality'],
+        difficulty: diff in DIFFICULTY_CONFIGS ? diff : 'veteran'
       };
+      this.syncDifficultyUI(this.settings.difficulty);
       this.callbacks.onSettingsChanged(this.settings);
     };
 
     sensInput.addEventListener('input', emitSettings);
     volInput.addEventListener('input', emitSettings);
     qualSelect.addEventListener('change', emitSettings);
+    this.pauseDiffSelect.addEventListener('change', emitSettings);
   }
 }

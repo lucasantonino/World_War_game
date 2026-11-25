@@ -1,7 +1,15 @@
 import * as THREE from 'three';
 import { AudioEngine } from '../engine/AudioEngine';
+import { getDifficultyConfig } from '../engine/DifficultyConfig';
 import { InputManager } from '../engine/InputManager';
-import { CoverState, DamageIndicator, InteractablePoint, WeaponId } from '../types';
+import {
+  CoverState,
+  DamageIndicator,
+  DifficultyModifier,
+  InteractablePoint,
+  PlayerCheckpointSnapshot,
+  WeaponId
+} from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
 import { ProjectileSystem } from './ProjectileSystem';
@@ -94,6 +102,10 @@ export class PlayerController {
   public overheadProtected = false;
   public isCrouching = false;
   public isSprinting = false;
+  public peekDanger = 0;
+  public isRegenerating = false;
+  private peekExposureTimer = 0;
+  private timeSinceLastDamage = 99;
 
   public weaponId: WeaponId = 'rifle';
   public magAmmo: Record<WeaponId, number> = { rifle: 8, smg: 30, bazooka: 1, grenade: 1 };
@@ -170,6 +182,10 @@ export class PlayerController {
     this.isSprinting = false;
     this.currentEyeOffset = 1.64;
     this.leanCurrent = 0;
+    this.peekDanger = 0;
+    this.isRegenerating = false;
+    this.peekExposureTimer = 0;
+    this.timeSinceLastDamage = 99;
 
     this.weaponId = 'rifle';
     this.viewModel.setWeapon('rifle');
@@ -196,6 +212,26 @@ export class PlayerController {
     this.lastDamageCause = 'Fogo cruzado inimigo';
   }
 
+  public captureCheckpointState(): PlayerCheckpointSnapshot {
+    return {
+      hp: this.hp,
+      bandages: this.bandages,
+      weaponId: this.weaponId,
+      magAmmo: { ...this.magAmmo },
+      reserveAmmo: { ...this.reserveAmmo }
+    };
+  }
+
+  public restoreFromCheckpoint(snap: PlayerCheckpointSnapshot, x: number, z: number, yaw: number): void {
+    this.resetForMission(x, z, yaw);
+    this.hp = Math.max(75, Math.min(this.maxHp, snap.hp));
+    this.bandages = Math.max(2, snap.bandages);
+    this.magAmmo = { ...snap.magAmmo };
+    this.reserveAmmo = { ...snap.reserveAmmo };
+    this.weaponId = snap.weaponId === 'grenade' && this.reserveAmmo.grenade <= 0 ? 'rifle' : snap.weaponId;
+    this.viewModel.setWeapon(this.weaponId);
+  }
+
   public getEyeY(): number {
     return this.pos.y + this.currentEyeOffset;
   }
@@ -213,14 +249,27 @@ export class PlayerController {
     }
   }
 
-  public applyDamage(amount: number, sourcePos: THREE.Vector3, cause: string, causeBleed: boolean): void {
+  public applyDamage(
+    amount: number,
+    sourcePos: THREE.Vector3,
+    cause: string,
+    causeBleed: boolean,
+    diffConfig?: DifficultyModifier
+  ): void {
     if (this.hp <= 0) return;
-    this.hp = Math.max(0, this.hp - amount);
+    this.timeSinceLastDamage = 0;
+    this.isRegenerating = false;
+
+    const diffMult = diffConfig?.enemyDamageMult ?? 1;
+    const peekMult = this.coverState === 'peeking' ? 0.62 + 0.38 * this.peekDanger : 1.0;
+    const finalDamage = amount * diffMult * peekMult;
+
+    this.hp = Math.max(0, this.hp - finalDamage);
     this.lastDamageCause = cause;
-    if (causeBleed && this.hp > 0) {
+    if (causeBleed && this.hp > 0 && this.hp < 78) {
       this.bleeding = true;
     }
-    this.addShake(Math.min(0.65, amount / 45));
+    this.addShake(Math.min(0.65, finalDamage / 45));
 
     const dx = sourcePos.x - this.pos.x;
     const dz = sourcePos.z - this.pos.z;
@@ -228,7 +277,7 @@ export class PlayerController {
     this.damageIndicators.push({
       id: this.nextDamageId++,
       angleRad: worldAngle + this.yaw,
-      intensity: Math.min(1, amount / 30),
+      intensity: Math.min(1, finalDamage / 30),
       age: 0
     });
   }
@@ -256,12 +305,15 @@ export class PlayerController {
     dt: number,
     mouseSensitivity: number,
     interactables: InteractablePoint[],
-    onActionTriggered: (kind: InteractablePoint['kind'], id: string) => void
+    onActionTriggered: (kind: InteractablePoint['kind'], id: string) => void,
+    diffConfig: DifficultyModifier = getDifficultyConfig('veteran')
   ): {
     interactPrompt: string | null;
     actionProgress: number;
     actionLabel: string | null;
   } {
+    this.timeSinceLastDamage += dt;
+
     // 1. Mouse look
     const { dx, dy } = this.input.consumeMouseDelta();
     const sens = 0.0021 * mouseSensitivity * (1 - this.adsFactor * 0.42);
@@ -380,6 +432,34 @@ export class PlayerController {
       this.pos.x = this.mgAnchorPos.x;
       this.pos.z = this.mgAnchorPos.z;
       this.pos.y = this.terrain.getTerrainHeight(this.pos.x, this.pos.z);
+    }
+
+    // 4b. Accumulated Exposure Time & Partial Cover Regeneration
+    if (this.coverState === 'dugout' || this.coverState === 'sheltered') {
+      this.peekExposureTimer = Math.max(0, this.peekExposureTimer - 1.9 * dt);
+    } else if (this.coverState === 'peeking') {
+      const leanFactor = Math.abs(this.leanCurrent) > 0.25 ? 0.72 : 1.0;
+      this.peekExposureTimer = Math.min(
+        diffConfig.peekLockTime,
+        Math.max(0, this.peekExposureTimer + dt * leanFactor - speedRatio * 0.45 * dt)
+      );
+    } else {
+      const rate = diffConfig.peekLockTime / Math.max(0.4, diffConfig.openLockTime);
+      this.peekExposureTimer = Math.min(diffConfig.peekLockTime, this.peekExposureTimer + dt * rate);
+    }
+    this.peekDanger = Math.max(0, Math.min(1, this.peekExposureTimer / Math.max(0.5, diffConfig.peekLockTime)));
+
+    if (
+      this.hp > 0 &&
+      this.hp < diffConfig.regenCapHp &&
+      !this.bleeding &&
+      this.timeSinceLastDamage >= diffConfig.regenDelaySec &&
+      (this.coverState === 'dugout' || this.coverState === 'sheltered')
+    ) {
+      this.isRegenerating = true;
+      this.hp = Math.min(diffConfig.regenCapHp, this.hp + diffConfig.regenRatePerSec * dt);
+    } else {
+      this.isRegenerating = false;
     }
 
     // 5. Suppression decay (fast in cover, slow in the open)

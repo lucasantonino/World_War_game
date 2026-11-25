@@ -13,13 +13,15 @@ import {
   InteractablePoint,
   MissionConfig,
   MissionEndSummary,
-  MissionId
+  MissionId,
+  PlayerCheckpointSnapshot
 } from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { EnvironmentBuilder } from '../world/EnvironmentBuilder';
 import { getMissionConfig } from '../world/MissionData';
 import { Terrain } from '../world/Terrain';
 import { AudioEngine } from './AudioEngine';
+import { DIFFICULTY_CONFIGS, getDifficultyConfig } from './DifficultyConfig';
 import { InputManager } from './InputManager';
 
 const STORAGE_COMPLETED_KEY = 'tdn_completed_ops_v1';
@@ -58,6 +60,14 @@ export class GameEngine {
   private airRaidAlert: string | null = null;
   private pendingSpawns: Array<{ delay: number; action: () => void }> = [];
   private liveInteractables: InteractablePoint[] = [];
+
+  private checkpointPhaseIndex = 0;
+  private checkpointSnapshot: PlayerCheckpointSnapshot | null = null;
+  private checkpointToast: string | null = null;
+  private checkpointToastTimer = 0;
+  private checkpointKills = 0;
+  private checkpointTanks = 0;
+  private checkpointElapsed = 0;
 
   private settings: GameSettings;
   private completedMissions = new Set<MissionId>();
@@ -152,6 +162,10 @@ export class GameEngine {
         this.audio.unlock();
         this.startMission(this.selectedMissionId);
       },
+      onRetryCheckpoint: () => {
+        this.audio.unlock();
+        this.retryFromCheckpoint();
+      },
       onReturnToMenu: () => {
         this.wasInMission = false;
         this.input.setGameplayActive(false);
@@ -233,6 +247,13 @@ export class GameEngine {
     this.airRaidAlert = null;
     this.radioCaption = null;
     this.radioCaptionTimer = 0;
+    this.checkpointPhaseIndex = 0;
+    this.checkpointSnapshot = null;
+    this.checkpointToast = null;
+    this.checkpointToastTimer = 0;
+    this.checkpointKills = 0;
+    this.checkpointTanks = 0;
+    this.checkpointElapsed = 0;
     this.wasInMission = true;
 
     this.beginPhase(0);
@@ -243,12 +264,88 @@ export class GameEngine {
     this.input.requestLock();
   }
 
-  private beginPhase(idx: number): void {
+  private retryFromCheckpoint(): void {
+    const diffConfig = getDifficultyConfig(this.settings.difficulty);
+    if (!this.checkpointSnapshot || !diffConfig.allowCheckpoints) {
+      this.startMission(this.selectedMissionId);
+      return;
+    }
+
+    const cfg = getMissionConfig(this.selectedMissionId);
+    this.activeMission = cfg;
+    this.clearCombatActors();
+
+    this.terrain.loadMission(cfg);
+    this.envBuilder.buildMission(cfg, this.settings.quality);
+    this.liveInteractables = cfg.interactables.map((i) => ({ ...i }));
+
+    let spawnX = cfg.playerSpawn.x;
+    let spawnZ = cfg.playerSpawn.z;
+    const spawnYaw = cfg.playerSpawn.yaw;
+    const curPhase = cfg.phases[this.checkpointPhaseIndex];
+    const prevPhase = cfg.phases[this.checkpointPhaseIndex - 1];
+    if (curPhase?.type === 'plant_charge' || curPhase?.type === 'detonate_wait') {
+      spawnX = 0;
+      spawnZ = -25;
+    } else if (prevPhase?.type === 'reach_zone' && prevPhase.targetZone) {
+      spawnX = prevPhase.targetZone.x;
+      spawnZ = prevPhase.targetZone.z;
+    }
+
+    this.player.restoreFromCheckpoint(this.checkpointSnapshot, spawnX, spawnZ, spawnYaw);
+    this.player.viewModel.root.visible = true;
+
+    for (const inter of this.liveInteractables) {
+      if (inter.kind === 'radio') {
+        inter.active = curPhase?.type === 'activate_radio';
+      } else if (inter.kind === 'bunker_charge') {
+        inter.active = curPhase?.type === 'plant_charge';
+      }
+    }
+
+    this.soldiers.spawnAllies(cfg.allyCount);
+    this.soldiers.spawnEmplacedGunners(cfg.enemyEmplacements);
+
+    this.kills = this.checkpointKills;
+    this.tanksDestroyed = this.checkpointTanks;
+    this.missionElapsed = this.checkpointElapsed;
+    this.airRaidAlert = null;
+    this.radioCaption = null;
+    this.radioCaptionTimer = 0;
+    this.checkpointToast = null;
+    this.checkpointToastTimer = 0;
+    this.wasInMission = true;
+
+    this.beginPhase(this.checkpointPhaseIndex, false);
+
+    this.screen = 'playing';
+    this.ui.setScreen('playing');
+    this.input.setGameplayActive(true);
+    this.input.requestLock();
+  }
+
+  private beginPhase(idx: number, saveCheckpoint = true): void {
     this.phaseIndex = idx;
     const phase = this.activeMission.phases[idx];
     if (!phase) {
       this.finishMission(true);
       return;
+    }
+
+    const diffConfig = getDifficultyConfig(this.settings.difficulty);
+    if (
+      saveCheckpoint &&
+      idx >= 1 &&
+      idx < this.activeMission.phases.length &&
+      diffConfig.allowCheckpoints
+    ) {
+      this.checkpointPhaseIndex = idx;
+      this.checkpointSnapshot = this.player.captureCheckpointState();
+      this.checkpointKills = this.kills;
+      this.checkpointTanks = this.tanksDestroyed;
+      this.checkpointElapsed = this.missionElapsed;
+      this.checkpointToast = `CHECKPOINT SALVO — FASE ${idx + 1}`;
+      this.checkpointToastTimer = 3.5;
     }
 
     this.phaseTimer = phase.durationSeconds ?? 0;
@@ -281,13 +378,15 @@ export class GameEngine {
       this.bombers.triggerBomberRun(() => {
         this.airRaidAlert = null;
         if (phase.enemiesToSpawn && phase.enemyRoles) {
-          this.soldiers.spawnEnemySquad(phase.enemiesToSpawn, phase.enemyRoles);
+          const enemyCount = Math.max(1, Math.round(phase.enemiesToSpawn * diffConfig.waveCountMult));
+          this.soldiers.spawnEnemySquad(enemyCount, phase.enemyRoles);
           this.pushRadioCaption('Bombardeio passou! Infantaria inimiga avançando pela fumaça!');
         }
       });
     } else if (phase.enemiesToSpawn && phase.enemyRoles) {
-      const firstBatch = Math.min(10, phase.enemiesToSpawn);
-      const rest = phase.enemiesToSpawn - firstBatch;
+      const enemyCount = Math.max(1, Math.round(phase.enemiesToSpawn * diffConfig.waveCountMult));
+      const firstBatch = Math.min(10, enemyCount);
+      const rest = enemyCount - firstBatch;
       this.soldiers.spawnEnemySquad(firstBatch, phase.enemyRoles);
       if (rest > 0) {
         this.pendingSpawns.push({
@@ -360,7 +459,8 @@ export class GameEngine {
       const falloff = 1 - (distToPlayer / radius) * 0.65;
       const dmg = maxDamage * falloff * coverReduction;
       if (dmg > 4) {
-        this.player.applyDamage(dmg, center, cause, dmg > 25);
+        const diffConfig = getDifficultyConfig(this.settings.difficulty);
+        this.player.applyDamage(dmg, center, cause, dmg > 25, diffConfig);
       }
     }
   }
@@ -389,6 +489,16 @@ export class GameEngine {
       advice = 'Fique atento ao aviso de granada próxima — afaste-se ou pressione [F] bem perto dela para chutá-la de volta.';
     }
 
+    const diffConfig = getDifficultyConfig(this.settings.difficulty);
+    const canRetryCheckpoint =
+      !victory &&
+      diffConfig.allowCheckpoints &&
+      this.checkpointSnapshot !== null &&
+      this.checkpointPhaseIndex >= 1;
+    const checkpointPhaseLabel = canRetryCheckpoint
+      ? `Fase ${this.checkpointPhaseIndex + 1}`
+      : null;
+
     const summary: MissionEndSummary = {
       missionId: this.activeMission.id,
       missionTitle: `${this.activeMission.code} — ${this.activeMission.title}`,
@@ -399,17 +509,26 @@ export class GameEngine {
       kills: this.kills,
       tanksDestroyed: this.tanksDestroyed,
       shotsFired: this.player.shotsFired,
-      shotsHit: this.player.shotsHit
+      shotsHit: this.player.shotsHit,
+      difficulty: this.settings.difficulty,
+      canRetryCheckpoint,
+      checkpointPhaseLabel
     };
     this.ui.showMissionEnd(summary);
   }
 
   private updateGameplay(dt: number): void {
     this.missionElapsed += dt;
+    const diffConfig = getDifficultyConfig(this.settings.difficulty);
 
     if (this.radioCaptionTimer > 0) {
       this.radioCaptionTimer -= dt;
       if (this.radioCaptionTimer <= 0) this.radioCaption = null;
+    }
+
+    if (this.checkpointToastTimer > 0) {
+      this.checkpointToastTimer -= dt;
+      if (this.checkpointToastTimer <= 0) this.checkpointToast = null;
     }
 
     // Pending reinforcement waves
@@ -443,7 +562,8 @@ export class GameEngine {
             this.beginPhase(this.phaseIndex + 1);
           }
         }
-      }
+      },
+      diffConfig
     );
 
     // Update entities
@@ -453,7 +573,9 @@ export class GameEngine {
       this.player.getEyeY(),
       this.player.exposure,
       this.bombers.isWarningOrPassing(),
-      (msg) => this.pushRadioCaption(msg)
+      (msg) => this.pushRadioCaption(msg),
+      this.player.peekDanger,
+      diffConfig
     );
 
     this.tanks.update(
@@ -463,46 +585,54 @@ export class GameEngine {
       this.player.exposure,
       (center, radius, maxDmg, craterR, craterD, cause) => {
         this.handleExplosion(center, radius, maxDmg, craterR, craterD, cause, false);
-      }
+      },
+      this.player.peekDanger,
+      diffConfig
     );
 
     this.bombers.update(dt, this.player.pos.x);
 
-    this.projectiles.update(dt, this.player.pos, this.player.getEyeY(), {
-      onHitEnemySoldier: (pos, dir, damage, isPlayerShot) => {
-        const res = this.soldiers.checkBulletHit('enemy', pos, dir, damage, () => {
-          if (isPlayerShot) this.kills++;
-        });
-        if (res.hit && isPlayerShot) {
-          this.player.registerHitMarker(res.headshot);
+    this.projectiles.update(
+      dt,
+      this.player.pos,
+      this.player.getEyeY(),
+      {
+        onHitEnemySoldier: (pos, dir, damage, isPlayerShot) => {
+          const res = this.soldiers.checkBulletHit('enemy', pos, dir, damage, () => {
+            if (isPlayerShot) this.kills++;
+          });
+          if (res.hit && isPlayerShot) {
+            this.player.registerHitMarker(res.headshot);
+          }
+          return res.hit;
+        },
+        onHitAllySoldier: (pos, dir, damage) => {
+          return this.soldiers.checkBulletHit('ally', pos, dir, damage).hit;
+        },
+        onHitPlayer: (damage, origin, cause, causeBleed) => {
+          this.player.applyDamage(damage, origin, cause, causeBleed, diffConfig);
+        },
+        onNearMissPlayer: (origin) => {
+          const pan = Math.max(-1, Math.min(1, (origin.x - this.player.pos.x) / 14));
+          this.audio.playBulletWhiz(pan);
+          this.player.applySuppression(0.24);
+        },
+        onHitTank: (pos, _damage, isRocket) => {
+          const hit = this.tanks.checkProjectileHit(pos, isRocket, () => {
+            this.tanksDestroyed++;
+            this.pushRadioCaption('TANQUE INIMIGO ABATIDO!');
+          });
+          if (hit && isRocket) {
+            this.player.registerHitMarker(true);
+          }
+          return hit;
+        },
+        onExplosion: (center, radius, maxDamage, craterR, craterD, cause, isFromPlayer) => {
+          this.handleExplosion(center, radius, maxDamage, craterR, craterD, cause, isFromPlayer);
         }
-        return res.hit;
       },
-      onHitAllySoldier: (pos, dir, damage) => {
-        return this.soldiers.checkBulletHit('ally', pos, dir, damage).hit;
-      },
-      onHitPlayer: (damage, origin, cause, causeBleed) => {
-        this.player.applyDamage(damage, origin, cause, causeBleed);
-      },
-      onNearMissPlayer: (origin) => {
-        const pan = Math.max(-1, Math.min(1, (origin.x - this.player.pos.x) / 14));
-        this.audio.playBulletWhiz(pan);
-        this.player.applySuppression(0.24);
-      },
-      onHitTank: (pos, _damage, isRocket) => {
-        const hit = this.tanks.checkProjectileHit(pos, isRocket, () => {
-          this.tanksDestroyed++;
-          this.pushRadioCaption('TANQUE INIMIGO ABATIDO!');
-        });
-        if (hit && isRocket) {
-          this.player.registerHitMarker(true);
-        }
-        return hit;
-      },
-      onExplosion: (center, radius, maxDamage, craterR, craterD, cause, isFromPlayer) => {
-        this.handleExplosion(center, radius, maxDamage, craterR, craterD, cause, isFromPlayer);
-      }
-    });
+      diffConfig.bleedChanceMult
+    );
 
     this.vfx.update(dt);
     this.envBuilder.update(dt, this.totalElapsed);
@@ -674,7 +804,13 @@ export class GameEngine {
       hitMarkerTimer: this.player.hitMarkerTimer,
       hitMarkerCrit: this.player.hitMarkerCrit,
       spreadPx,
-      showControlsHint: this.missionElapsed < 18 && this.selectedMissionId === 0
+      showControlsHint: this.missionElapsed < 18 && this.selectedMissionId === 0,
+      peekDanger: this.player.peekDanger,
+      isRegenerating: this.player.isRegenerating,
+      difficulty: this.settings.difficulty,
+      phaseIndex: this.phaseIndex,
+      totalPhases: this.activeMission.phases.length,
+      checkpointToast: this.checkpointToast
     };
 
     this.ui.updateHUD(hud);
@@ -721,17 +857,41 @@ export class GameEngine {
   }
 
   private loadSettings(): GameSettings {
+    const defaults: GameSettings = {
+      mouseSensitivity: 1.0,
+      masterVolume: 0.75,
+      quality: 'medium',
+      difficulty: 'veteran'
+    };
     try {
       const raw = localStorage.getItem(STORAGE_SETTINGS_KEY);
-      if (raw) return JSON.parse(raw) as GameSettings;
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<GameSettings>;
+        const difficulty =
+          parsed.difficulty && parsed.difficulty in DIFFICULTY_CONFIGS
+            ? parsed.difficulty
+            : defaults.difficulty;
+        const quality =
+          parsed.quality === 'low' || parsed.quality === 'medium' || parsed.quality === 'high'
+            ? parsed.quality
+            : defaults.quality;
+        return {
+          mouseSensitivity:
+            typeof parsed.mouseSensitivity === 'number'
+              ? parsed.mouseSensitivity
+              : defaults.mouseSensitivity,
+          masterVolume:
+            typeof parsed.masterVolume === 'number'
+              ? parsed.masterVolume
+              : defaults.masterVolume,
+          quality,
+          difficulty
+        };
+      }
     } catch {
       // Ignore
     }
-    return {
-      mouseSensitivity: 1.0,
-      masterVolume: 0.75,
-      quality: 'medium'
-    };
+    return defaults;
   }
 
   private saveSettings(): void {
