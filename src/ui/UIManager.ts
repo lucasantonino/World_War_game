@@ -5,7 +5,9 @@ import {
   HUDState,
   MissionConfig,
   MissionEndSummary,
-  MissionId
+  MissionId,
+  TouchControlMode,
+  WeaponId
 } from '../types';
 import { DIFFICULTY_CONFIGS } from '../engine/DifficultyConfig';
 import { WEAPON_STATS } from '../entities/PlayerController';
@@ -21,6 +23,15 @@ export interface UICallbacks {
   onReturnToMenu: () => void;
   onNextMission: () => void;
   onSettingsChanged: (settings: GameSettings) => void;
+  onTouchMove: (x: number, y: number, sprinting: boolean) => void;
+  onTouchLook: (dx: number, dy: number) => void;
+  onTouchFire: (firing: boolean) => void;
+  onTouchAdsToggle: () => void;
+  onTouchKeyPress: (code: string) => void;
+  onTouchKeyHold: (code: string, held: boolean) => void;
+  onTouchSelectWeapon: (id: WeaponId) => void;
+  onTouchCycleWeapon: () => void;
+  onTouchPause: () => void;
 }
 
 const COVER_LABELS: Record<HUDState['coverState'], string> = {
@@ -55,6 +66,7 @@ export class UIManager {
   private objPhaseEl!: HTMLElement;
   private objMainEl!: HTMLElement;
   private objSubEl!: HTMLElement;
+  private swarmCountEl!: HTMLElement;
   private checkpointToastEl!: HTMLElement;
   private airRaidEl!: HTMLElement;
   private radioEl!: HTMLElement;
@@ -85,11 +97,18 @@ export class UIManager {
   private extraAmmoEl!: HTMLElement;
   private slotEls: HTMLElement[] = [];
   private controlsToastEl!: HTMLElement;
+  private touchControlsEl!: HTMLElement;
+  private touchBtnInteract!: HTMLElement;
+  private touchBtnAds!: HTMLElement;
+  private orientationWarnEl!: HTMLElement;
+  private dismissedPortraitWarning = false;
+  private resetActiveTouchInputs: (() => void) | null = null;
 
   // Menu & Pause / End refs
   private diffBtns: HTMLButtonElement[] = [];
   private diffDescEl!: HTMLElement;
   private pauseDiffSelect!: HTMLSelectElement;
+  private pauseTouchSelect!: HTMLSelectElement;
   private endRetryBtn!: HTMLButtonElement;
   private endCheckpointBtn!: HTMLButtonElement;
 
@@ -194,6 +213,9 @@ export class UIManager {
     this.pauseEl.classList.toggle('hidden', screen !== 'paused');
     this.endEl.classList.toggle('hidden', screen !== 'kia' && screen !== 'victory');
     this.hudEl.classList.toggle('hidden', screen !== 'playing');
+    if (screen !== 'playing') {
+      this.resetActiveTouchInputs?.();
+    }
   }
 
   public updateHUD(state: HUDState): void {
@@ -241,6 +263,14 @@ export class UIManager {
     const distTag =
       state.objectiveDistance !== null ? ` • ${Math.round(state.objectiveDistance)}m` : '';
     this.objSubEl.textContent = `${state.objectiveSubtext}${distTag}`;
+
+    if (state.remainingWaveEnemies > 0 || state.livingEnemies > 0) {
+      this.swarmCountEl.textContent = `INIMIGOS NO SETOR: ${state.livingEnemies} • VAGA RESTANTE: ${state.remainingWaveEnemies}`;
+      this.swarmCountEl.classList.remove('hidden');
+    } else {
+      this.swarmCountEl.textContent = '';
+      this.swarmCountEl.classList.add('hidden');
+    }
 
     if (state.checkpointToast) {
       this.checkpointToastEl.textContent = state.checkpointToast;
@@ -359,7 +389,14 @@ export class UIManager {
       el.classList.toggle('active', !state.mgMounted && state.weaponId === slotOrder[idx]);
     });
 
-    this.controlsToastEl.classList.toggle('hidden', !state.showControlsHint);
+    this.controlsToastEl.classList.toggle('hidden', state.touchActive || !state.showControlsHint);
+    this.touchControlsEl.classList.toggle('hidden', !state.touchActive);
+    this.touchBtnInteract.classList.toggle('highlight', Boolean(state.interactPrompt));
+    this.touchBtnAds.classList.toggle('active', state.adsFactor > 0.4);
+
+    const showPortraitWarning =
+      state.touchActive && window.innerHeight > window.innerWidth && !this.dismissedPortraitWarning;
+    this.orientationWarnEl.classList.toggle('hidden', !showPortraitWarning);
   }
 
   private buildDOM(): void {
@@ -458,6 +495,14 @@ export class UIManager {
                 <option value="infernal" ${this.settings.difficulty === 'infernal' ? 'selected' : ''}>Infernal</option>
               </select>
             </div>
+            <div class="setting-row">
+              <label for="set-touch">Controles Touch (Celular)</label>
+              <select id="set-touch">
+                <option value="auto" ${this.settings.touchControls === 'auto' ? 'selected' : ''}>Automático</option>
+                <option value="on" ${this.settings.touchControls === 'on' ? 'selected' : ''}>Ativado</option>
+                <option value="off" ${this.settings.touchControls === 'off' ? 'selected' : ''}>Desativado</option>
+              </select>
+            </div>
           </div>
           <div class="controls-grid">
             <div class="control-pair"><span>Mover / Correr</span><span><kbd>WASD</kbd> <kbd>Shift</kbd></span></div>
@@ -527,6 +572,7 @@ export class UIManager {
             <div id="hud-obj-phase" class="objective-phase-meta">FASE 1/1 • VETERANO</div>
             <div id="hud-obj-main" class="objective-main">OBJETIVO</div>
             <div id="hud-obj-sub" class="objective-sub">...</div>
+            <div id="hud-swarm-count" class="objective-swarm-meta hidden"></div>
           </div>
           <div id="hud-checkpoint-toast" class="checkpoint-toast hidden"></div>
           <div id="hud-air-raid" class="air-raid-banner hidden">ALERTA AÉREO</div>
@@ -583,10 +629,46 @@ export class UIManager {
             </div>
           </div>
           <div class="weapon-slots">
-            <div class="slot-chip active">[1] Fuzil</div>
-            <div class="slot-chip">[2] SMG</div>
-            <div class="slot-chip">[3] Bazuca</div>
-            <div class="slot-chip">[4] Granada</div>
+            <div class="slot-chip active" data-slot="rifle">[1] Fuzil</div>
+            <div class="slot-chip" data-slot="smg">[2] SMG</div>
+            <div class="slot-chip" data-slot="bazooka">[3] Bazuca</div>
+            <div class="slot-chip" data-slot="grenade">[4] Granada</div>
+          </div>
+        </div>
+
+        <!-- MOBILE TOUCH CONTROLS -->
+        <div id="touch-controls" class="touch-controls hidden">
+          <div id="touch-look-zone" class="touch-look-zone"></div>
+
+          <button id="touch-btn-pause" type="button" class="touch-btn">PAUSA</button>
+
+          <div id="touch-joy-zone" class="touch-joy-zone">
+            <div class="touch-joy-base">
+              <div id="touch-joy-knob" class="touch-joy-knob"></div>
+            </div>
+          </div>
+
+          <div class="touch-cluster-left">
+            <button id="touch-btn-crouch" type="button" class="touch-btn">AGACHAR</button>
+            <button id="touch-btn-jump" type="button" class="touch-btn">ESCALAR</button>
+            <button id="touch-btn-heal" type="button" class="touch-btn">CURATIVO</button>
+            <button id="touch-btn-interact" type="button" class="touch-btn">INTERAGIR</button>
+          </div>
+
+          <div class="touch-cluster-right">
+            <button id="touch-btn-ads" type="button" class="touch-btn">MIRAR</button>
+            <button id="touch-btn-reload" type="button" class="touch-btn">RECARREGAR</button>
+            <button id="touch-btn-grenade" type="button" class="touch-btn">GRANADA</button>
+            <button id="touch-btn-weapon" type="button" class="touch-btn">ARMA</button>
+            <button id="touch-btn-fire" type="button" class="touch-btn fire">ATIRAR</button>
+          </div>
+        </div>
+
+        <div id="orientation-warning" class="orientation-warning hidden">
+          <div class="orientation-card">
+            <div class="orientation-title">GIRE O APARELHO PARA A HORIZONTAL</div>
+            <div class="orientation-sub">Modo paisagem recomendado para controle com os dois polegares.</div>
+            <button id="btn-dismiss-portrait" type="button" class="btn-secondary">Continuar mesmo assim</button>
           </div>
         </div>
       </div>
@@ -607,6 +689,7 @@ export class UIManager {
     this.objPhaseEl = this.root.querySelector('#hud-obj-phase')!;
     this.objMainEl = this.root.querySelector('#hud-obj-main')!;
     this.objSubEl = this.root.querySelector('#hud-obj-sub')!;
+    this.swarmCountEl = this.root.querySelector('#hud-swarm-count')!;
     this.checkpointToastEl = this.root.querySelector('#hud-checkpoint-toast')!;
     this.airRaidEl = this.root.querySelector('#hud-air-raid')!;
     this.radioEl = this.root.querySelector('#hud-radio')!;
@@ -637,15 +720,22 @@ export class UIManager {
     this.extraAmmoEl = this.root.querySelector('#hud-extra-ammo')!;
     this.slotEls = Array.from(this.root.querySelectorAll('.slot-chip'));
     this.controlsToastEl = this.root.querySelector('#controls-toast')!;
+    this.touchControlsEl = this.root.querySelector('#touch-controls')!;
+    this.touchBtnInteract = this.root.querySelector('#touch-btn-interact')!;
+    this.touchBtnAds = this.root.querySelector('#touch-btn-ads')!;
+    this.orientationWarnEl = this.root.querySelector('#orientation-warning')!;
 
     this.diffBtns = Array.from(this.root.querySelectorAll('.diff-btn')) as HTMLButtonElement[];
     this.diffDescEl = this.root.querySelector('#menu-diff-desc')!;
     this.pauseDiffSelect = this.root.querySelector('#set-diff') as HTMLSelectElement;
+    this.pauseTouchSelect = this.root.querySelector('#set-touch') as HTMLSelectElement;
+    this.pauseTouchSelect.value = this.settings.touchControls;
     this.endRetryBtn = this.root.querySelector('#btn-end-retry') as HTMLButtonElement;
     this.endCheckpointBtn = this.root.querySelector('#btn-end-checkpoint') as HTMLButtonElement;
 
     this.renderOperationsList();
     this.bindButtonEvents();
+    this.bindTouchControls();
   }
 
   private renderOperationsList(): void {
@@ -758,11 +848,15 @@ export class UIManager {
 
     const emitSettings = () => {
       const diff = this.pauseDiffSelect.value as DifficultyLevel;
+      const touchVal = this.pauseTouchSelect.value as TouchControlMode;
+      const touchControls: TouchControlMode =
+        touchVal === 'on' || touchVal === 'off' || touchVal === 'auto' ? touchVal : 'auto';
       this.settings = {
         mouseSensitivity: parseFloat(sensInput.value),
         masterVolume: parseFloat(volInput.value),
         quality: qualSelect.value as GameSettings['quality'],
-        difficulty: diff in DIFFICULTY_CONFIGS ? diff : 'veteran'
+        difficulty: diff in DIFFICULTY_CONFIGS ? diff : 'veteran',
+        touchControls
       };
       this.syncDifficultyUI(this.settings.difficulty);
       this.callbacks.onSettingsChanged(this.settings);
@@ -772,5 +866,218 @@ export class UIManager {
     volInput.addEventListener('input', emitSettings);
     qualSelect.addEventListener('change', emitSettings);
     this.pauseDiffSelect.addEventListener('change', emitSettings);
+    this.pauseTouchSelect.addEventListener('change', emitSettings);
+
+    this.root.querySelector('#btn-dismiss-portrait')!.addEventListener('click', () => {
+      this.dismissedPortraitWarning = true;
+      this.orientationWarnEl.classList.add('hidden');
+    });
+
+    for (const slotEl of this.slotEls) {
+      slotEl.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const slot = slotEl.dataset.slot as WeaponId | undefined;
+        if (slot) {
+          this.callbacks.onTouchSelectWeapon(slot);
+        }
+      });
+    }
+  }
+
+  private bindTouchControls(): void {
+    const joyZone = this.root.querySelector('#touch-joy-zone') as HTMLElement;
+    const joyBase = joyZone.querySelector('.touch-joy-base') as HTMLElement;
+    const joyKnob = this.root.querySelector('#touch-joy-knob') as HTMLElement;
+    const lookZone = this.root.querySelector('#touch-look-zone') as HTMLElement;
+    const fireBtn = this.root.querySelector('#touch-btn-fire') as HTMLElement;
+    const pauseBtn = this.root.querySelector('#touch-btn-pause') as HTMLElement;
+
+    let joyPointerId: number | null = null;
+    let lookPointerId: number | null = null;
+    let lastLookX = 0;
+    let lastLookY = 0;
+    let firePointerId: number | null = null;
+    let lastFireX = 0;
+    let lastFireY = 0;
+
+    const heldButtons = new Map<number, { el: HTMLElement; onRelease: () => void }>();
+
+    const updateJoystick = (clientX: number, clientY: number) => {
+      const rect = joyBase.getBoundingClientRect();
+      const centerX = rect.left + rect.width * 0.5;
+      const centerY = rect.top + rect.height * 0.5;
+      const maxRadius = Math.max(36, rect.width * 0.44);
+
+      const dx = clientX - centerX;
+      const dy = clientY - centerY;
+      const dist = Math.hypot(dx, dy);
+
+      let nx = dx;
+      let ny = dy;
+      if (dist > maxRadius && dist > 0) {
+        nx = (dx / dist) * maxRadius;
+        ny = (dy / dist) * maxRadius;
+      }
+
+      joyKnob.style.transform = `translate(calc(-50% + ${nx.toFixed(1)}px), calc(-50% + ${ny.toFixed(1)}px))`;
+
+      const ratio = dist / maxRadius;
+      if (ratio < 0.14) {
+        this.callbacks.onTouchMove(0, 0, false);
+        return;
+      }
+
+      const moveX = nx / maxRadius;
+      const moveY = -ny / maxRadius;
+      const sprinting = moveY > 0.78 && ratio > 0.85;
+      this.callbacks.onTouchMove(moveX, moveY, sprinting);
+    };
+
+    const resetJoystick = () => {
+      joyPointerId = null;
+      joyKnob.style.transform = 'translate(-50%, -50%)';
+      this.callbacks.onTouchMove(0, 0, false);
+    };
+
+    const resetAll = () => {
+      if (joyPointerId !== null) {
+        resetJoystick();
+      }
+      lookPointerId = null;
+      if (firePointerId !== null) {
+        firePointerId = null;
+        fireBtn.classList.remove('active');
+        this.callbacks.onTouchFire(false);
+      }
+      for (const [, entry] of heldButtons) {
+        entry.el.classList.remove('active');
+        entry.onRelease();
+      }
+      heldButtons.clear();
+    };
+
+    this.resetActiveTouchInputs = resetAll;
+
+    this.touchControlsEl.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    joyZone.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (joyPointerId !== null) return;
+      joyPointerId = e.pointerId;
+      updateJoystick(e.clientX, e.clientY);
+    });
+
+    lookZone.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      if (lookPointerId !== null) return;
+      lookPointerId = e.pointerId;
+      lastLookX = e.clientX;
+      lastLookY = e.clientY;
+    });
+
+    fireBtn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (firePointerId !== null) return;
+      firePointerId = e.pointerId;
+      lastFireX = e.clientX;
+      lastFireY = e.clientY;
+      fireBtn.classList.add('active');
+      this.callbacks.onTouchFire(true);
+    });
+
+    const bindTapButton = (selector: string, onTap: () => void) => {
+      const btn = this.root.querySelector(selector) as HTMLElement;
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.classList.add('active');
+        onTap();
+        window.setTimeout(() => btn.classList.remove('active'), 110);
+      });
+    };
+
+    const bindHoldButton = (selector: string, code: string) => {
+      const btn = this.root.querySelector(selector) as HTMLElement;
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (heldButtons.has(e.pointerId)) return;
+        btn.classList.add('active');
+        this.callbacks.onTouchKeyHold(code, true);
+        heldButtons.set(e.pointerId, {
+          el: btn,
+          onRelease: () => this.callbacks.onTouchKeyHold(code, false)
+        });
+      });
+    };
+
+    bindTapButton('#touch-btn-crouch', () => this.callbacks.onTouchKeyPress('KeyC'));
+    bindHoldButton('#touch-btn-jump', 'Space');
+    bindHoldButton('#touch-btn-heal', 'KeyH');
+    bindTapButton('#touch-btn-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
+
+    this.touchBtnAds.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.callbacks.onTouchAdsToggle();
+    });
+
+    bindTapButton('#touch-btn-reload', () => this.callbacks.onTouchKeyPress('KeyR'));
+    bindHoldButton('#touch-btn-grenade', 'KeyG');
+    bindTapButton('#touch-btn-weapon', () => this.callbacks.onTouchCycleWeapon());
+
+    pauseBtn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      resetAll();
+      this.callbacks.onTouchPause();
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      if (e.pointerId === joyPointerId) {
+        updateJoystick(e.clientX, e.clientY);
+      }
+      if (e.pointerId === lookPointerId) {
+        const dx = e.clientX - lastLookX;
+        const dy = e.clientY - lastLookY;
+        lastLookX = e.clientX;
+        lastLookY = e.clientY;
+        this.callbacks.onTouchLook(dx, dy);
+      }
+      if (e.pointerId === firePointerId) {
+        const dx = e.clientX - lastFireX;
+        const dy = e.clientY - lastFireY;
+        lastFireX = e.clientX;
+        lastFireY = e.clientY;
+        this.callbacks.onTouchLook(dx, dy);
+      }
+    });
+
+    const handlePointerEnd = (e: PointerEvent) => {
+      if (e.pointerId === joyPointerId) {
+        resetJoystick();
+      }
+      if (e.pointerId === lookPointerId) {
+        lookPointerId = null;
+      }
+      if (e.pointerId === firePointerId) {
+        firePointerId = null;
+        fireBtn.classList.remove('active');
+        this.callbacks.onTouchFire(false);
+      }
+      const held = heldButtons.get(e.pointerId);
+      if (held) {
+        held.el.classList.remove('active');
+        held.onRelease();
+        heldButtons.delete(e.pointerId);
+      }
+    };
+
+    window.addEventListener('pointerup', handlePointerEnd);
+    window.addEventListener('pointercancel', handlePointerEnd);
+    window.addEventListener('blur', resetAll);
   }
 }

@@ -6,6 +6,7 @@ export type SoldierRole = 'rifleman' | 'assault' | 'grenadier' | 'mg_gunner' | '
 export type MissionId = 0 | 1 | 2 | 3;
 export type QualityLevel = 'low' | 'medium' | 'high';
 export type DifficultyLevel = 'recruit' | 'veteran' | 'infernal';
+export type TouchControlMode = 'auto' | 'on' | 'off';
 export type GameScreen = 'menu' | 'briefing' | 'playing' | 'paused' | 'kia' | 'victory';
 
 export interface DifficultyModifier {
@@ -22,6 +23,9 @@ export interface DifficultyModifier {
   regenCapHp: number;
   regenDelaySec: number;
   regenRatePerSec: number;
+  maxSimultaneousMobile: number;
+  maxSimultaneousDesktopMed: number;
+  maxSimultaneousDesktopHigh: number;
 }
 
 export interface PlayerCheckpointSnapshot {
@@ -260,6 +264,9 @@ export interface HUDState {
   phaseIndex: number;
   totalPhases: number;
   checkpointToast: string | null;
+  livingEnemies: number;
+  remainingWaveEnemies: number;
+  touchActive: boolean;
 }
 
 export interface GameSettings {
@@ -267,6 +274,7 @@ export interface GameSettings {
   masterVolume: number;
   quality: QualityLevel;
   difficulty: DifficultyLevel;
+  touchControls: TouchControlMode;
 }
 
 export interface RaycastHit {

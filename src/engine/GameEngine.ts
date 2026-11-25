@@ -21,7 +21,7 @@ import { EnvironmentBuilder } from '../world/EnvironmentBuilder';
 import { getMissionConfig } from '../world/MissionData';
 import { Terrain } from '../world/Terrain';
 import { AudioEngine } from './AudioEngine';
-import { DIFFICULTY_CONFIGS, getDifficultyConfig } from './DifficultyConfig';
+import { DIFFICULTY_CONFIGS, getDifficultyConfig, getMaxSimultaneousEnemies } from './DifficultyConfig';
 import { InputManager } from './InputManager';
 
 const STORAGE_COMPLETED_KEY = 'tdn_completed_ops_v1';
@@ -58,7 +58,6 @@ export class GameEngine {
   private radioCaption: string | null = null;
   private radioCaptionTimer = 0;
   private airRaidAlert: string | null = null;
-  private pendingSpawns: Array<{ delay: number; action: () => void }> = [];
   private liveInteractables: InteractablePoint[] = [];
 
   private checkpointPhaseIndex = 0;
@@ -94,6 +93,7 @@ export class GameEngine {
     this.audio = new AudioEngine();
     this.audio.setMasterVolume(this.settings.masterVolume);
     this.input = new InputManager(canvas);
+    this.input.setTouchModeOverride(this.settings.touchControls);
 
     this.terrain = new Terrain();
     this.scene.add(this.terrain.mesh);
@@ -152,7 +152,9 @@ export class GameEngine {
           this.screen = 'playing';
           this.ui.setScreen('playing');
           this.input.setGameplayActive(true);
-          this.input.requestLock();
+          if (!this.input.isTouchActive()) {
+            this.input.requestLock();
+          }
         } else {
           this.screen = 'menu';
           this.ui.setScreen('menu');
@@ -184,16 +186,40 @@ export class GameEngine {
         this.settings = { ...newSettings };
         this.audio.setMasterVolume(this.settings.masterVolume);
         this.renderer.shadowMap.enabled = this.settings.quality !== 'low';
+        this.input.setTouchModeOverride(this.settings.touchControls);
         this.saveSettings();
+      },
+      onTouchMove: (x, y, sprinting) => {
+        this.input.setTouchMove(x, y, sprinting);
+      },
+      onTouchLook: (dx, dy) => {
+        this.input.addTouchLookDelta(dx, dy);
+      },
+      onTouchFire: (firing) => {
+        this.input.setTouchFiring(firing);
+      },
+      onTouchAdsToggle: () => {
+        this.input.toggleTouchAds();
+      },
+      onTouchKeyPress: (code) => {
+        this.input.triggerVirtualKeyPress(code);
+      },
+      onTouchKeyHold: (code, held) => {
+        this.input.setVirtualKeyHold(code, held);
+      },
+      onTouchSelectWeapon: (id) => {
+        this.player.selectWeapon(id);
+      },
+      onTouchCycleWeapon: () => {
+        this.player.cycleWeapon();
+      },
+      onTouchPause: () => {
+        this.pauseGameplay();
       }
     });
 
     this.input.setOnPauseRequested(() => {
-      if (this.screen === 'playing') {
-        this.screen = 'paused';
-        this.input.setGameplayActive(false);
-        this.ui.setScreen('paused');
-      }
+      this.pauseGameplay();
     });
 
     window.addEventListener('resize', () => {
@@ -204,6 +230,22 @@ export class GameEngine {
 
     this.previewMenuScene(0);
     this.animate();
+  }
+
+  private pauseGameplay(): void {
+    if (this.screen === 'playing') {
+      this.screen = 'paused';
+      this.input.setGameplayActive(false);
+      this.ui.setScreen('paused');
+    }
+  }
+
+  private isMobileDevice(): boolean {
+    return (
+      window.matchMedia('(pointer: coarse)').matches ||
+      navigator.maxTouchPoints > 0 ||
+      window.innerWidth <= 900
+    );
   }
 
   private previewMenuScene(id: MissionId): void {
@@ -221,7 +263,6 @@ export class GameEngine {
     this.soldiers.clear();
     this.tanks.clear();
     this.bombers.clear();
-    this.pendingSpawns = [];
   }
 
   private startMission(id: MissionId): void {
@@ -261,7 +302,9 @@ export class GameEngine {
     this.screen = 'playing';
     this.ui.setScreen('playing');
     this.input.setGameplayActive(true);
-    this.input.requestLock();
+    if (!this.input.isTouchActive()) {
+      this.input.requestLock();
+    }
   }
 
   private retryFromCheckpoint(): void {
@@ -321,7 +364,9 @@ export class GameEngine {
     this.screen = 'playing';
     this.ui.setScreen('playing');
     this.input.setGameplayActive(true);
-    this.input.requestLock();
+    if (!this.input.isTouchActive()) {
+      this.input.requestLock();
+    }
   }
 
   private beginPhase(idx: number, saveCheckpoint = true): void {
@@ -373,31 +418,25 @@ export class GameEngine {
       }
     }
 
+    const maxSimultaneous = getMaxSimultaneousEnemies(
+      this.settings.difficulty,
+      this.settings.quality,
+      this.isMobileDevice()
+    );
+
     if (phase.type === 'bomber_storm') {
       this.airRaidAlert = 'ALERTA AÉREO — ENTRE NO ABRIGO SUBTERRÂNEO!';
       this.bombers.triggerBomberRun(() => {
         this.airRaidAlert = null;
         if (phase.enemiesToSpawn && phase.enemyRoles) {
           const enemyCount = Math.max(1, Math.round(phase.enemiesToSpawn * diffConfig.waveCountMult));
-          this.soldiers.spawnEnemySquad(enemyCount, phase.enemyRoles);
+          this.soldiers.queueEnemyWave(enemyCount, phase.enemyRoles, maxSimultaneous);
           this.pushRadioCaption('Bombardeio passou! Infantaria inimiga avançando pela fumaça!');
         }
       });
     } else if (phase.enemiesToSpawn && phase.enemyRoles) {
       const enemyCount = Math.max(1, Math.round(phase.enemiesToSpawn * diffConfig.waveCountMult));
-      const firstBatch = Math.min(10, enemyCount);
-      const rest = enemyCount - firstBatch;
-      this.soldiers.spawnEnemySquad(firstBatch, phase.enemyRoles);
-      if (rest > 0) {
-        this.pendingSpawns.push({
-          delay: 6.5,
-          action: () => {
-            if (this.screen === 'playing') {
-              this.soldiers.spawnEnemySquad(rest, phase.enemyRoles!);
-            }
-          }
-        });
-      }
+      this.soldiers.queueEnemyWave(enemyCount, phase.enemyRoles, maxSimultaneous);
     }
   }
 
@@ -531,16 +570,6 @@ export class GameEngine {
       if (this.checkpointToastTimer <= 0) this.checkpointToast = null;
     }
 
-    // Pending reinforcement waves
-    for (let i = this.pendingSpawns.length - 1; i >= 0; i--) {
-      this.pendingSpawns[i].delay -= dt;
-      if (this.pendingSpawns[i].delay <= 0) {
-        const act = this.pendingSpawns[i].action;
-        this.pendingSpawns.splice(i, 1);
-        act();
-      }
-    }
-
     // Player update
     const playerInteraction = this.player.update(
       dt,
@@ -563,7 +592,8 @@ export class GameEngine {
           }
         }
       },
-      diffConfig
+      diffConfig,
+      (origin, dir) => this.soldiers.findAutoAimTarget(origin, dir)
     );
 
     // Update entities
@@ -666,14 +696,13 @@ export class GameEngine {
 
       let advance = false;
       if (phase.type === 'survive_wave') {
-        if (this.pendingSpawns.length === 0 && this.soldiers.getLivingEnemyCount() === 0) {
+        if (this.soldiers.getRemainingWaveCount() === 0) {
           advance = true;
         }
       } else if (phase.type === 'destroy_tanks') {
         if (
           this.tanks.getLivingTankCount() === 0 &&
-          this.pendingSpawns.length === 0 &&
-          this.soldiers.getLivingEnemyCount() <= 2
+          this.soldiers.getRemainingWaveCount() <= 2
         ) {
           advance = true;
         }
@@ -681,7 +710,7 @@ export class GameEngine {
         if (
           !this.bombers.isActive() &&
           this.tanks.getLivingTankCount() === 0 &&
-          this.soldiers.getLivingEnemyCount() === 0
+          this.soldiers.getRemainingWaveCount() === 0
         ) {
           advance = true;
         }
@@ -697,8 +726,7 @@ export class GameEngine {
       } else if (phase.type === 'clear_trench') {
         if (
           this.tanks.getLivingTankCount() === 0 &&
-          this.pendingSpawns.length === 0 &&
-          this.soldiers.getLivingEnemyCount() <= 1
+          this.soldiers.getRemainingWaveCount() <= 1
         ) {
           advance = true;
         }
@@ -810,7 +838,10 @@ export class GameEngine {
       difficulty: this.settings.difficulty,
       phaseIndex: this.phaseIndex,
       totalPhases: this.activeMission.phases.length,
-      checkpointToast: this.checkpointToast
+      checkpointToast: this.checkpointToast,
+      livingEnemies: this.soldiers.getLivingEnemyCount(),
+      remainingWaveEnemies: this.soldiers.getRemainingWaveCount(),
+      touchActive: this.input.isTouchActive()
     };
 
     this.ui.updateHUD(hud);
@@ -861,7 +892,8 @@ export class GameEngine {
       mouseSensitivity: 1.0,
       masterVolume: 0.75,
       quality: 'medium',
-      difficulty: 'veteran'
+      difficulty: 'veteran',
+      touchControls: 'auto'
     };
     try {
       const raw = localStorage.getItem(STORAGE_SETTINGS_KEY);
@@ -875,6 +907,12 @@ export class GameEngine {
           parsed.quality === 'low' || parsed.quality === 'medium' || parsed.quality === 'high'
             ? parsed.quality
             : defaults.quality;
+        const touchControls =
+          parsed.touchControls === 'auto' ||
+          parsed.touchControls === 'on' ||
+          parsed.touchControls === 'off'
+            ? parsed.touchControls
+            : defaults.touchControls;
         return {
           mouseSensitivity:
             typeof parsed.mouseSensitivity === 'number'
@@ -885,7 +923,8 @@ export class GameEngine {
               ? parsed.masterVolume
               : defaults.masterVolume,
           quality,
-          difficulty
+          difficulty,
+          touchControls
         };
       }
     } catch {

@@ -301,12 +301,36 @@ export class PlayerController {
     this.audio.playUiClick();
   }
 
+  public selectWeapon(id: WeaponId): void {
+    if (this.mgMounted || this.bandagingProgress > 0 || this.cookingGrenade) return;
+    this.switchWeapon(id);
+  }
+
+  public cycleWeapon(): void {
+    if (this.mgMounted || this.bandagingProgress > 0 || this.cookingGrenade) return;
+    const order: WeaponId[] = ['rifle', 'smg', 'bazooka', 'grenade'];
+    const currentIdx = order.indexOf(this.weaponId);
+    for (let offset = 1; offset <= order.length; offset++) {
+      const nextId = order[(currentIdx + offset) % order.length];
+      if (nextId === 'grenade' && this.reserveAmmo.grenade <= 0) continue;
+      this.switchWeapon(nextId);
+      return;
+    }
+  }
+
+  public toggleCrouch(): void {
+    if (!this.mgMounted) {
+      this.isCrouching = !this.isCrouching;
+    }
+  }
+
   public update(
     dt: number,
     mouseSensitivity: number,
     interactables: InteractablePoint[],
     onActionTriggered: (kind: InteractablePoint['kind'], id: string) => void,
-    diffConfig: DifficultyModifier = getDifficultyConfig('veteran')
+    diffConfig: DifficultyModifier = getDifficultyConfig('veteran'),
+    findAutoAimTarget?: (origin: THREE.Vector3, lookDir: THREE.Vector3) => THREE.Vector3 | null
   ): {
     interactPrompt: string | null;
     actionProgress: number;
@@ -348,9 +372,10 @@ export class PlayerController {
       this.isCrouching = !this.isCrouching;
     }
 
-    const forwardInput = (this.input.isKeyDown('KeyW') ? 1 : 0) - (this.input.isKeyDown('KeyS') ? 1 : 0);
-    const strafeInput = (this.input.isKeyDown('KeyD') ? 1 : 0) - (this.input.isKeyDown('KeyA') ? 1 : 0);
-    const wantsMove = forwardInput !== 0 || strafeInput !== 0;
+    const moveIn = this.input.getMovementInput();
+    const forwardInput = moveIn.forward;
+    const strafeInput = moveIn.strafe;
+    const wantsMove = Math.abs(forwardInput) > 0.001 || Math.abs(strafeInput) > 0.001;
 
     // ADS (RMB)
     const wantsAds =
@@ -360,8 +385,28 @@ export class PlayerController {
       this.weaponId !== 'grenade';
     this.adsFactor = THREE.MathUtils.lerp(this.adsFactor, wantsAds ? 1 : 0, Math.min(1, dt * 13));
 
+    // Light touch auto-aim tracking when aiming or firing
+    let currentAutoTarget: THREE.Vector3 | null = null;
+    if (this.input.isTouchActive() && findAutoAimTarget) {
+      const lookDir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+      currentAutoTarget = findAutoAimTarget(this.camera.position, lookDir);
+      if (currentAutoTarget && (this.adsFactor > 0.25 || this.input.isLeftMouseDown()) && !this.mgMounted) {
+        const dx = currentAutoTarget.x - this.camera.position.x;
+        const dy = currentAutoTarget.y - this.camera.position.y;
+        const dz = currentAutoTarget.z - this.camera.position.z;
+        const targetYaw = Math.atan2(-dx, -dz);
+        const targetPitch = Math.atan2(dy, Math.hypot(dx, dz));
+        let yawDiff = targetYaw - this.yaw;
+        while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+        while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+        const aimPull = Math.min(1, dt * 4.2);
+        this.yaw += yawDiff * aimPull;
+        this.pitch = Math.max(-1.42, Math.min(1.42, THREE.MathUtils.lerp(this.pitch, targetPitch, aimPull)));
+      }
+    }
+
     const wantsSprint =
-      this.input.isKeyDown('ShiftLeft') &&
+      (moveIn.sprinting || this.input.isKeyDown('ShiftLeft')) &&
       wantsMove &&
       forwardInput > 0 &&
       !this.isCrouching &&
@@ -411,9 +456,10 @@ export class PlayerController {
       let moveX = (-sin * forwardInput + cos * strafeInput);
       let moveZ = (-cos * forwardInput - sin * strafeInput);
       const len = Math.hypot(moveX, moveZ);
+      const inputMag = Math.min(1, Math.hypot(forwardInput, strafeInput));
       if (len > 0.001) {
-        moveX = (moveX / len) * speed * dt;
-        moveZ = (moveZ / len) * speed * dt;
+        moveX = (moveX / len) * speed * inputMag * dt;
+        moveZ = (moveZ / len) * speed * inputMag * dt;
       }
 
       const wantsMantle = this.input.isKeyDown('Space');
@@ -422,7 +468,7 @@ export class PlayerController {
       this.pos.y = THREE.MathUtils.lerp(this.pos.y, res.y, Math.min(1, dt * 18));
       this.pos.z = res.z;
 
-      speedRatio = speed / 6.15;
+      speedRatio = (speed * inputMag) / 6.15;
       this.footstepTimer -= dt * (this.isSprinting ? 1.4 : 1.0);
       if (this.footstepTimer <= 0) {
         this.footstepTimer = this.isCrouching ? 0.54 : 0.39;
@@ -540,7 +586,7 @@ export class PlayerController {
 
     if (this.mgMounted) {
       if (this.input.isLeftMouseDown() && !this.mgOverheated && this.fireCooldown <= 0) {
-        this.fireMountedMG();
+        this.fireMountedMG(currentAutoTarget);
       }
     } else if (
       this.weaponId !== 'grenade' &&
@@ -555,7 +601,7 @@ export class PlayerController {
 
       if (wantsFire && this.fireCooldown <= 0) {
         if (this.magAmmo[this.weaponId] > 0) {
-          this.fireActiveWeapon();
+          this.fireActiveWeapon(currentAutoTarget);
         } else if (this.reserveAmmo[this.weaponId] > 0) {
           this.startReload();
         }
@@ -708,7 +754,15 @@ export class PlayerController {
     this.projectiles.spawnGrenade(origin, dir.multiplyScalar(17.5), fuse, 'ally');
   }
 
-  private fireActiveWeapon(): void {
+  private applyTouchAutoAimToDir(dir: THREE.Vector3, autoTarget: THREE.Vector3 | null): void {
+    if (!this.input.isTouchActive() || !autoTarget) return;
+    const toTarget = autoTarget.clone().sub(this.camera.position);
+    if (toTarget.lengthSq() <= 0.0001) return;
+    toTarget.normalize();
+    dir.lerp(toTarget, 0.42).normalize();
+  }
+
+  private fireActiveWeapon(autoTarget: THREE.Vector3 | null = null): void {
     const stats = WEAPON_STATS[this.weaponId];
     this.magAmmo[this.weaponId]--;
     this.fireCooldown = stats.fireInterval;
@@ -718,6 +772,9 @@ export class PlayerController {
     const spread = spreadBase * (1 + this.suppression * 1.4);
 
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    if (this.weaponId !== 'grenade') {
+      this.applyTouchAutoAimToDir(dir, autoTarget);
+    }
     dir.x += (Math.random() - 0.5) * spread;
     dir.y += (Math.random() - 0.5) * spread;
     dir.z += (Math.random() - 0.5) * spread;
@@ -747,7 +804,7 @@ export class PlayerController {
     this.recoilOffsetYaw += (Math.random() - 0.5) * stats.recoilYaw;
   }
 
-  private fireMountedMG(): void {
+  private fireMountedMG(autoTarget: THREE.Vector3 | null = null): void {
     this.fireCooldown = 0.085;
     this.shotsFired++;
     this.mgHeat = Math.min(1, this.mgHeat + 0.042);
@@ -756,6 +813,7 @@ export class PlayerController {
     }
 
     const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    this.applyTouchAutoAimToDir(dir, autoTarget);
     dir.x += (Math.random() - 0.5) * 0.024;
     dir.y += (Math.random() - 0.5) * 0.024;
     dir.normalize();

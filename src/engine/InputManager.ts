@@ -1,3 +1,5 @@
+import { TouchControlMode } from '../types';
+
 export class InputManager {
   private canvas: HTMLCanvasElement;
   private keysDown = new Set<string>();
@@ -11,8 +13,22 @@ export class InputManager {
   private activeGameplay = false;
   private onPauseCallback: (() => void) | null = null;
 
+  private touchDetected = false;
+  private touchMode: TouchControlMode = 'auto';
+  private touchMoveX = 0;
+  private touchMoveY = 0;
+  private touchSprinting = false;
+  private touchLookDx = 0;
+  private touchLookDy = 0;
+  private touchFiring = false;
+  private touchFiringClicked = false;
+  private touchAds = false;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
+    this.touchDetected =
+      typeof window !== 'undefined' &&
+      ('ontouchstart' in window || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0));
     this.bindListeners();
   }
 
@@ -31,6 +47,7 @@ export class InputManager {
   }
 
   public requestLock(): void {
+    if (this.isTouchActive()) return;
     if (document.pointerLockElement !== this.canvas) {
       try {
         const res = this.canvas.requestPointerLock() as unknown as Promise<void> | undefined;
@@ -43,6 +60,63 @@ export class InputManager {
         // Ignore gracefully
       }
     }
+  }
+
+  public setTouchModeOverride(mode: TouchControlMode): void {
+    this.touchMode = mode;
+  }
+
+  public isTouchActive(): boolean {
+    if (this.touchMode === 'on') return true;
+    if (this.touchMode === 'off') return false;
+    return this.touchDetected;
+  }
+
+  public setTouchMove(x: number, y: number, sprinting = false): void {
+    this.touchMoveX = Math.max(-1, Math.min(1, x));
+    this.touchMoveY = Math.max(-1, Math.min(1, y));
+    this.touchSprinting = sprinting;
+  }
+
+  public addTouchLookDelta(dx: number, dy: number): void {
+    this.touchLookDx += dx;
+    this.touchLookDy += dy;
+  }
+
+  public setTouchFiring(firing: boolean): void {
+    if (firing && !this.touchFiring) {
+      this.touchFiringClicked = true;
+    }
+    this.touchFiring = firing;
+  }
+
+  public toggleTouchAds(): void {
+    this.touchAds = !this.touchAds;
+  }
+
+  public setTouchAds(active: boolean): void {
+    this.touchAds = active;
+  }
+
+  public triggerVirtualKeyPress(code: string): void {
+    this.keysPressed.add(code);
+  }
+
+  public setVirtualKeyHold(code: string, held: boolean): void {
+    if (held) {
+      this.keysDown.add(code);
+    } else {
+      this.keysDown.delete(code);
+    }
+  }
+
+  public getMovementInput(): { forward: number; strafe: number; sprinting: boolean } {
+    const kbForward = (this.keysDown.has('KeyW') ? 1 : 0) - (this.keysDown.has('KeyS') ? 1 : 0);
+    const kbStrafe = (this.keysDown.has('KeyD') ? 1 : 0) - (this.keysDown.has('KeyA') ? 1 : 0);
+    const forward = Math.max(-1, Math.min(1, kbForward + this.touchMoveY));
+    const strafe = Math.max(-1, Math.min(1, kbStrafe + this.touchMoveX));
+    const sprinting = this.keysDown.has('ShiftLeft') || this.touchSprinting;
+    return { forward, strafe, sprinting };
   }
 
   public isPointerLocked(): boolean {
@@ -62,26 +136,29 @@ export class InputManager {
   }
 
   public isLeftMouseDown(): boolean {
-    return this.mouseLeftDown;
+    return this.mouseLeftDown || this.touchFiring;
   }
 
   public consumeLeftMouseClick(): boolean {
-    if (this.mouseLeftClicked) {
+    if (this.mouseLeftClicked || this.touchFiringClicked) {
       this.mouseLeftClicked = false;
+      this.touchFiringClicked = false;
       return true;
     }
     return false;
   }
 
   public isRightMouseDown(): boolean {
-    return this.mouseRightDown;
+    return this.mouseRightDown || this.touchAds;
   }
 
   public consumeMouseDelta(): { dx: number; dy: number } {
-    const dx = this.deltaX;
-    const dy = this.deltaY;
+    const dx = this.deltaX + this.touchLookDx;
+    const dy = this.deltaY + this.touchLookDy;
     this.deltaX = 0;
     this.deltaY = 0;
+    this.touchLookDx = 0;
+    this.touchLookDy = 0;
     return { dx, dy };
   }
 
@@ -93,9 +170,25 @@ export class InputManager {
     this.mouseRightDown = false;
     this.deltaX = 0;
     this.deltaY = 0;
+    this.touchMoveX = 0;
+    this.touchMoveY = 0;
+    this.touchSprinting = false;
+    this.touchLookDx = 0;
+    this.touchLookDy = 0;
+    this.touchFiring = false;
+    this.touchFiringClicked = false;
+    this.touchAds = false;
   }
 
   private bindListeners(): void {
+    window.addEventListener(
+      'touchstart',
+      () => {
+        this.touchDetected = true;
+      },
+      { passive: true }
+    );
+
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Space' || e.code === 'Tab') {
         if (this.activeGameplay) {
@@ -128,7 +221,7 @@ export class InputManager {
 
     this.canvas.addEventListener('mousedown', (e) => {
       if (!this.activeGameplay) return;
-      if (!this.pointerLocked) {
+      if (!this.pointerLocked && !this.isTouchActive()) {
         this.requestLock();
       }
       if (e.button === 0) {

@@ -146,12 +146,12 @@ export const MISSIONS: MissionConfig[] = [
         id: 'op1_p1',
         type: 'survive_wave',
         objectiveText: 'SEGURE A TRINCHEIRA — PRIMEIRA VAGA',
-        objectiveSubtext: 'Elimine a vanguarda inimiga que avança pela neblina',
+        objectiveSubtext: 'Elimine as vagas de vanguarda inimiga que avançam pela neblina',
         objectiveTarget: { x: 0, z: -12 },
-        enemiesToSpawn: 14,
+        enemiesToSpawn: 95,
         enemyRoles: ['rifleman', 'rifleman', 'assault'],
         artilleryRate: 12,
-        radioOpening: 'Posto 2 na escuta! Vultos na Terra de Ninguém! Abaixo do parapeito!'
+        radioOpening: 'Posto 2 na escuta! Vultos incontáveis na Terra de Ninguém! Abaixo do parapeito!'
       },
       {
         id: 'op1_p2',
@@ -159,7 +159,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveText: 'CONTER O ASSALTO E GRANADEIROS',
         objectiveSubtext: 'Atenção às granadas lançadas para dentro da vala',
         objectiveTarget: { x: -4, z: -8 },
-        enemiesToSpawn: 20,
+        enemiesToSpawn: 130,
         enemyRoles: ['rifleman', 'assault', 'grenadier', 'rifleman'],
         artilleryRate: 5.5,
         radioOpening: 'Artilharia inimiga ajustando mira! Cuidado com os granadeiros nos flancos!'
@@ -170,7 +170,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveText: 'DESTRUA O TANQUE LEVE E A ESCOLTA',
         objectiveSubtext: 'Equipe a Bazuca [3] e acerte a lateral ou traseira do blindado',
         objectiveTarget: { x: 4, z: 6 },
-        enemiesToSpawn: 16,
+        enemiesToSpawn: 110,
         enemyRoles: ['assault', 'rifleman', 'grenadier'],
         tanksToSpawn: [
           {
@@ -282,7 +282,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveText: 'DESTRUA O TANQUE DE VANGUARDA',
         objectiveSubtext: 'Acerte os flancos ou retaguarda com a Bazuca [3]',
         objectiveTarget: { x: -8, z: 2 },
-        enemiesToSpawn: 16,
+        enemiesToSpawn: 100,
         enemyRoles: ['rifleman', 'assault', 'grenadier'],
         tanksToSpawn: [
           {
@@ -305,7 +305,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveText: 'DETENHA A PINÇA BLINDADA (2 TANQUES)',
         objectiveSubtext: 'Reabasteça foguetes nas caixas [F] e elimine os dois tanques',
         objectiveTarget: { x: 8, z: -2 },
-        enemiesToSpawn: 22,
+        enemiesToSpawn: 140,
         enemyRoles: ['assault', 'rifleman', 'grenadier', 'assault'],
         tanksToSpawn: [
           {
@@ -334,9 +334,9 @@ export const MISSIONS: MissionConfig[] = [
         id: 'op2_p3',
         type: 'survive_wave',
         objectiveText: 'LIQUIDE A INFANTARIA DE ASSALTO',
-        objectiveSubtext: 'Sem cobertura blindada, eles vêm com tudo sobre a trincheira',
+        objectiveSubtext: 'Sem cobertura blindada, eles vêm em massa sobre a trincheira',
         objectiveTarget: { x: 0, z: 5 },
-        enemiesToSpawn: 14,
+        enemiesToSpawn: 120,
         enemyRoles: ['assault', 'grenadier', 'assault'],
         artilleryRate: 11,
         radioOpening: 'Blindados abatidos! Mantenham fogo cerrado na infantaria remanescente!'
@@ -416,7 +416,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveSubtext: 'Corra para o ABRIGO subterrâneo antes da passagem dos bombardeiros',
         objectiveTarget: { x: -16, z: 35 },
         bomberWaves: 1,
-        enemiesToSpawn: 12,
+        enemiesToSpawn: 90,
         enemyRoles: ['assault', 'rifleman'],
         radioOpening: 'SIRENE AÉREA! Bombardeiros no horizonte! Todo mundo para os ABRIGOS!'
       },
@@ -427,7 +427,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveSubtext: 'Sobreviva às bombas no abrigo e destrua o tanque + assalto seguinte',
         objectiveTarget: { x: 16, z: 35 },
         bomberWaves: 2,
-        enemiesToSpawn: 18,
+        enemiesToSpawn: 130,
         enemyRoles: ['assault', 'grenadier', 'rifleman'],
         tanksToSpawn: [
           {
@@ -454,10 +454,10 @@ export const MISSIONS: MissionConfig[] = [
         id: 'op3_p4',
         type: 'hold_timer',
         objectiveText: 'RESISTA ATÉ O APOIO CHEGAR (25s)',
-        objectiveSubtext: 'Segure a linha contra assalto desesperado inimigo',
+        objectiveSubtext: 'Segure a linha contra a maré desesperada de assalto inimigo',
         objectiveTarget: { x: 0, z: 18 },
         durationSeconds: 25,
-        enemiesToSpawn: 22,
+        enemiesToSpawn: 150,
         enemyRoles: ['assault', 'assault', 'grenadier', 'rifleman'],
         artilleryRate: 5,
         radioOpening: 'Sinal confirmado! 25 segundos para nossa artilharia varrer o setor! Aguentem firme!'
@@ -582,7 +582,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveSubtext: 'Chegue ao posto avançado no centro do campo (Z 0)',
         objectiveTarget: { x: 0, z: 1 },
         targetZone: { x: 0, z: 1, radius: 7.5 },
-        enemiesToSpawn: 14,
+        enemiesToSpawn: 110,
         enemyRoles: ['rifleman', 'assault'],
         artilleryRate: 8,
         radioOpening: 'Sinalizadores no alto! Use as crateras e a vala central — não fique em terreno plano!'
@@ -593,7 +593,7 @@ export const MISSIONS: MissionConfig[] = [
         objectiveText: 'TOME A TRINCHEIRA INIMIGA E SILENCIE O BASTIÃO',
         objectiveSubtext: 'Destrua o Tanque de Comando e neutralize a guarnição inimiga',
         objectiveTarget: { x: 0, z: -25 },
-        enemiesToSpawn: 18,
+        enemiesToSpawn: 150,
         enemyRoles: ['assault', 'grenadier', 'rifleman', 'officer'],
         tanksToSpawn: [
           {
