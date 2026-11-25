@@ -35,6 +35,10 @@ body,
   color: var(--text-primary);
   font-family: var(--font-sans);
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
+  overscroll-behavior: none;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -42,6 +46,7 @@ body,
   display: block;
   width: 100%;
   height: 100%;
+  touch-action: none;
 }
 
 #ui-layer {
@@ -49,6 +54,7 @@ body,
   inset: 0;
   pointer-events: none;
   overflow: hidden;
+  touch-action: none;
 }
 
 button,
@@ -71,6 +77,8 @@ button {
   position: absolute;
   inset: 0;
   pointer-events: auto;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -1247,10 +1255,7 @@ button {
 
 .touch-look-zone {
   position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 36%;
+  inset: 0;
   z-index: 1;
   pointer-events: auto;
   touch-action: none;
@@ -1259,23 +1264,23 @@ button {
 
 .touch-joy-zone {
   position: absolute;
-  left: 16px;
-  bottom: 16px;
-  width: 156px;
-  height: 156px;
+  left: 6px;
+  bottom: 8px;
+  width: 158px;
+  height: 158px;
   z-index: 12;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   pointer-events: auto;
   touch-action: none;
   -webkit-tap-highlight-color: transparent;
 }
 
 .touch-joy-base {
-  position: relative;
-  width: 122px;
-  height: 122px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 112px;
+  height: 112px;
   border-radius: 50%;
   background: rgba(14, 16, 14, 0.5);
   border: 2px solid rgba(236, 231, 218, 0.28);
@@ -1287,8 +1292,8 @@ button {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 50px;
-  height: 50px;
+  width: 46px;
+  height: 46px;
   transform: translate(-50%, -50%);
   border-radius: 50%;
   background: radial-gradient(circle at 35% 35%, rgba(236, 231, 218, 0.88), rgba(180, 174, 156, 0.55));
@@ -1302,16 +1307,17 @@ button {
   touch-action: none;
   -webkit-tap-highlight-color: transparent;
   user-select: none;
-  min-width: 66px;
-  height: 40px;
-  padding: 0 10px;
+  -webkit-user-select: none;
+  min-width: 56px;
+  height: 36px;
+  padding: 0 8px;
   border-radius: 8px;
   background: rgba(16, 18, 15, 0.72);
   border: 1px solid rgba(236, 231, 218, 0.26);
   color: var(--text-primary);
   font-family: var(--font-display);
-  font-size: 0.72rem;
-  letter-spacing: 0.05em;
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   backdrop-filter: blur(4px);
   display: inline-flex;
@@ -1329,10 +1335,17 @@ button {
 }
 
 .touch-btn.highlight {
-  background: rgba(108, 163, 97, 0.38);
+  background: rgba(108, 163, 97, 0.42);
   border-color: #93cc87;
   color: #f2fff0;
-  box-shadow: 0 0 14px rgba(108, 163, 97, 0.55);
+  box-shadow: 0 0 14px rgba(108, 163, 97, 0.6);
+}
+
+.touch-btn.danger-pulse {
+  background: rgba(178, 44, 34, 0.55);
+  border-color: #ff9e94;
+  color: #fff0ee;
+  animation: pulseAlert 0.65s infinite alternate;
 }
 
 .touch-btn.empty {
@@ -1345,47 +1358,65 @@ button {
 }
 
 .touch-btn.fire {
-  width: 82px;
-  height: 82px;
+  width: 78px;
+  height: 78px;
   border-radius: 50%;
-  background: rgba(178, 44, 34, 0.78);
-  border: 2px solid rgba(255, 158, 144, 0.7);
-  font-size: 0.86rem;
+  background: rgba(178, 44, 34, 0.8);
+  border: 2px solid rgba(255, 158, 144, 0.75);
+  font-size: 0.8rem;
   font-weight: 700;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
   grid-column: 3;
-  grid-row: 2;
+  grid-row: 2 / span 2;
   align-self: center;
   justify-self: center;
 }
 
 .touch-btn.fire.active {
-  background: rgba(226, 62, 48, 0.92);
+  background: rgba(226, 62, 48, 0.94);
   border-color: #ffd0c9;
   transform: scale(0.95);
 }
 
 .touch-cluster-left {
   position: absolute;
-  left: 180px;
-  bottom: 20px;
+  left: 10px;
+  bottom: 170px;
   z-index: 12;
   display: grid;
-  grid-template-columns: repeat(2, auto);
-  gap: 8px;
+  grid-template-columns: repeat(3, auto);
+  gap: 5px;
   pointer-events: none;
 }
 
 .touch-cluster-right {
   position: absolute;
-  right: 16px;
-  bottom: 16px;
+  right: 10px;
+  bottom: 10px;
   z-index: 12;
   display: grid;
   grid-template-columns: repeat(3, auto);
-  gap: 8px;
+  gap: 5px;
   align-items: center;
+  justify-items: stretch;
   pointer-events: none;
+}
+
+.touch-btn-interact {
+  position: fixed;
+  left: 50%;
+  bottom: 112px;
+  transform: translateX(-50%);
+  z-index: 16;
+  min-width: 132px;
+  height: 40px;
+  font-size: 0.76rem;
+}
+
+.interact-prompt,
+.bino-telemetry {
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 
 #touch-btn-pause {
@@ -1449,6 +1480,24 @@ button {
 }
 
 @media (max-height: 520px), (max-width: 960px) {
+  .screen-overlay.centered {
+    align-items: center;
+    justify-content: flex-start;
+    overflow-y: auto;
+    padding: 12px;
+  }
+
+  .dossier-card,
+  .modal-card {
+    margin: auto;
+    padding: 16px;
+    width: min(680px, 95vw);
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) .controls-toast {
+    display: none;
+  }
+
   .hud-top {
     top: 6px;
     gap: 4px;
@@ -1563,45 +1612,80 @@ button {
   }
 
   .touch-joy-zone {
-    left: 10px;
-    bottom: 10px;
-    width: 136px;
-    height: 136px;
+    left: 6px;
+    bottom: 6px;
+    width: 142px;
+    height: 142px;
   }
 
   .touch-joy-base {
-    width: 108px;
-    height: 108px;
+    width: 104px;
+    height: 104px;
   }
 
   .touch-joy-knob {
-    width: 44px;
-    height: 44px;
+    width: 42px;
+    height: 42px;
   }
 
   .touch-cluster-left {
-    left: 150px;
-    bottom: 12px;
-    gap: 6px;
+    left: 8px;
+    bottom: 152px;
+    gap: 5px;
   }
 
   .touch-cluster-right {
-    right: 12px;
-    bottom: 12px;
-    gap: 6px;
+    right: 8px;
+    bottom: 8px;
+    gap: 5px;
   }
 
   .touch-btn {
-    min-width: 58px;
-    height: 36px;
-    padding: 0 8px;
-    font-size: 0.66rem;
+    min-width: 52px;
+    height: 33px;
+    padding: 0 7px;
+    font-size: 0.62rem;
   }
 
   .touch-btn.fire {
-    width: 74px;
-    height: 74px;
-    font-size: 0.78rem;
+    width: 70px;
+    height: 70px;
+    font-size: 0.72rem;
+  }
+
+  .touch-btn-interact {
+    bottom: 16px;
+    min-width: 118px;
+    height: 36px;
+    font-size: 0.7rem;
+  }
+}
+
+@media (max-width: 640px) and (orientation: portrait) {
+  .hud-top {
+    width: min(360px, 92vw);
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) .hud-bottom-left {
+    top: 122px;
+    left: 10px;
+    max-width: 46vw;
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) .hud-bottom-right {
+    top: 122px;
+    right: 10px;
+    max-width: 46vw;
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) #touch-btn-pause {
+    top: auto;
+    bottom: 196px;
+    right: 10px;
+  }
+
+  .touch-btn-interact {
+    bottom: 198px;
   }
 }
 

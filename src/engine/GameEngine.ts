@@ -167,9 +167,7 @@ export class GameEngine {
     this.survivalRecord = this.loadSurvivalRecord();
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.shadowMap.enabled = this.settings.quality !== 'low';
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
@@ -184,6 +182,7 @@ export class GameEngine {
     this.audio.setMasterVolume(this.settings.masterVolume);
     this.input = new InputManager(canvas);
     this.input.setTouchModeOverride(this.settings.touchControls);
+    this.applyRendererQuality();
 
     this.terrain = new Terrain();
     this.scene.add(this.terrain.mesh);
@@ -291,8 +290,8 @@ export class GameEngine {
       onSettingsChanged: (newSettings) => {
         this.settings = { ...newSettings };
         this.audio.setMasterVolume(this.settings.masterVolume);
-        this.renderer.shadowMap.enabled = this.settings.quality !== 'low';
         this.input.setTouchModeOverride(this.settings.touchControls);
+        this.applyRendererQuality();
         this.saveSettings();
       },
       onLoadoutChanged: (newLoadout) => {
@@ -313,9 +312,15 @@ export class GameEngine {
       },
       onTouchKeyPress: (code) => {
         this.input.triggerVirtualKeyPress(code);
+        if (code === 'Space') {
+          this.input.triggerTouchMantle(0.85);
+        }
       },
       onTouchKeyHold: (code, held) => {
         this.input.setVirtualKeyHold(code, held);
+        if (code === 'Space' && held) {
+          this.input.triggerTouchMantle(0.85);
+        }
       },
       onTouchSelectWeapon: (id) => {
         this.player.selectWeapon(id);
@@ -358,7 +363,8 @@ export class GameEngine {
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(w, h);
       if (this.composer) {
-        this.composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        const maxRatio = this.isMobileDevice() ? 1.35 : 2;
+        this.composer.setPixelRatio(Math.min(window.devicePixelRatio, maxRatio));
         this.composer.setSize(w, h);
       }
       if (this.bloomPass) {
@@ -390,6 +396,17 @@ export class GameEngine {
     this.composer.addPass(this.gradePass);
 
     this.applyMissionColorGrade(0);
+  }
+
+  private applyRendererQuality(): void {
+    const mobile = this.isMobileDevice();
+    const maxRatio = mobile ? 1.35 : 2;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxRatio));
+    this.renderer.shadowMap.enabled =
+      this.settings.quality !== 'low' && (!mobile || this.settings.quality === 'high');
+    if (this.composer) {
+      this.composer.setPixelRatio(Math.min(window.devicePixelRatio, maxRatio));
+    }
   }
 
   private shouldUsePostProcessing(): boolean {

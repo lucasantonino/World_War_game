@@ -1,5 +1,7 @@
 import { TouchControlMode } from '../types';
 
+const TOUCH_LOOK_GAIN = 3.25;
+
 export class InputManager {
   private canvas: HTMLCanvasElement;
   private keysDown = new Set<string>();
@@ -23,6 +25,7 @@ export class InputManager {
   private touchFiring = false;
   private touchFiringClicked = false;
   private touchAds = false;
+  private touchMantleTimer = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -79,8 +82,24 @@ export class InputManager {
   }
 
   public addTouchLookDelta(dx: number, dy: number): void {
-    this.touchLookDx += dx;
-    this.touchLookDy += dy;
+    const speed = Math.hypot(dx, dy);
+    const accel = 1.0 + Math.min(1.15, speed * 0.028);
+    const clampedX = Math.max(-90, Math.min(90, dx));
+    const clampedY = Math.max(-90, Math.min(90, dy));
+    this.touchLookDx += clampedX * TOUCH_LOOK_GAIN * accel;
+    this.touchLookDy += clampedY * TOUCH_LOOK_GAIN * accel;
+  }
+
+  public triggerTouchMantle(duration = 0.85): void {
+    this.touchMantleTimer = Math.max(this.touchMantleTimer, duration);
+  }
+
+  public consumeTouchMantle(dt: number): boolean {
+    if (this.touchMantleTimer > 0) {
+      this.touchMantleTimer = Math.max(0, this.touchMantleTimer - dt);
+      return true;
+    }
+    return false;
   }
 
   public setTouchFiring(firing: boolean): void {
@@ -178,6 +197,7 @@ export class InputManager {
     this.touchFiring = false;
     this.touchFiringClicked = false;
     this.touchAds = false;
+    this.touchMantleTimer = 0;
   }
 
   private bindListeners(): void {
@@ -220,8 +240,8 @@ export class InputManager {
     });
 
     this.canvas.addEventListener('mousedown', (e) => {
-      if (!this.activeGameplay) return;
-      if (!this.pointerLocked && !this.isTouchActive()) {
+      if (!this.activeGameplay || this.isTouchActive()) return;
+      if (!this.pointerLocked) {
         this.requestLock();
       }
       if (e.button === 0) {
@@ -233,6 +253,7 @@ export class InputManager {
     });
 
     window.addEventListener('mouseup', (e) => {
+      if (this.isTouchActive()) return;
       if (e.button === 0) {
         this.mouseLeftDown = false;
       } else if (e.button === 2) {
@@ -241,7 +262,7 @@ export class InputManager {
     });
 
     document.addEventListener('mousemove', (e) => {
-      if (!this.activeGameplay) return;
+      if (!this.activeGameplay || this.isTouchActive()) return;
       if (this.pointerLocked || this.mouseLeftDown) {
         const clampedX = Math.max(-120, Math.min(120, e.movementX || 0));
         const clampedY = Math.max(-120, Math.min(120, e.movementY || 0));

@@ -239,6 +239,7 @@ export class PlayerController {
   private recoilOffsetYaw = 0;
   private wireCutCooldown = 0;
   private nextDamageId = 1;
+  private touchAutoBandaging = false;
 
   private tankInputState = {
     throttle: 0,
@@ -283,6 +284,7 @@ export class PlayerController {
     this.bleeding = false;
     this.bandages = 3;
     this.bandagingProgress = 0;
+    this.touchAutoBandaging = false;
     this.suppression = 0;
     this.tinnitus = 0;
     this.dustOverlay = 0;
@@ -752,7 +754,7 @@ export class PlayerController {
         let yawDiff = targetYaw - this.yaw;
         while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
         while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
-        const aimPull = Math.min(1, dt * 4.2);
+        const aimPull = Math.min(1, dt * 6.2);
         this.yaw += yawDiff * aimPull;
         this.pitch = Math.max(-1.42, Math.min(1.42, THREE.MathUtils.lerp(this.pitch, targetPitch, aimPull)));
       }
@@ -816,7 +818,9 @@ export class PlayerController {
         moveZ = (moveZ / len) * speed * inputMag * dt;
       }
 
-      const wantsMantle = this.input.isKeyDown('Space');
+      const touchMantle = this.input.consumeTouchMantle(dt);
+      const touchAutoClimb = this.input.isTouchActive() && forwardInput > 0.68 && inputMag > 0.72;
+      const wantsMantle = this.input.isKeyDown('Space') || touchMantle || touchAutoClimb;
       const res = this.cover.resolvePlayerMovement(this.pos, moveX, moveZ, wantsMantle);
       this.pos.x = res.x;
       this.pos.y = THREE.MathUtils.lerp(this.pos.y, res.y, Math.min(1, dt * 18));
@@ -884,8 +888,22 @@ export class PlayerController {
     let actionProgress = 0;
     let actionLabel: string | null = null;
 
+    if (this.input.isTouchActive()) {
+      if (this.input.consumeKeyPress('KeyH') || this.input.isKeyDown('KeyH')) {
+        if (this.bandages > 0 && (this.bleeding || this.hp < 95) && !this.isSprinting && !this.mgMounted) {
+          this.touchAutoBandaging = true;
+        }
+      }
+      if (this.isSprinting || this.input.isLeftMouseDown() || this.mgMounted) {
+        this.touchAutoBandaging = false;
+      }
+    } else {
+      this.touchAutoBandaging = false;
+    }
+
+    const wantsBandage = this.input.isKeyDown('KeyH') || this.touchAutoBandaging;
     if (
-      this.input.isKeyDown('KeyH') &&
+      wantsBandage &&
       this.bandages > 0 &&
       (this.bleeding || this.hp < 95) &&
       !this.isSprinting &&
@@ -900,6 +918,7 @@ export class PlayerController {
       actionLabel = 'APLICANDO CURATIVO...';
       if (this.bandagingProgress >= 1) {
         this.bandagingProgress = 0;
+        this.touchAutoBandaging = false;
         this.bandages--;
         this.bleeding = false;
         this.hp = Math.min(this.maxHp, this.hp + 38);
@@ -907,6 +926,7 @@ export class PlayerController {
       }
     } else {
       this.bandagingProgress = 0;
+      this.touchAutoBandaging = false;
     }
 
     // 7. Weapon switching & Reloading
@@ -967,9 +987,10 @@ export class PlayerController {
       !this.cookingGrenade
     ) {
       const stats = WEAPON_STATS[this.weaponId];
-      const wantsFire = stats.automatic
-        ? this.input.isLeftMouseDown()
-        : this.input.consumeLeftMouseClick();
+      const wantsFire =
+        stats.automatic || this.input.isTouchActive()
+          ? this.input.isLeftMouseDown() || this.input.consumeLeftMouseClick()
+          : this.input.consumeLeftMouseClick();
 
       if (wantsFire && this.fireCooldown <= 0) {
         if (this.magAmmo[this.weaponId] > 0) {
@@ -1109,8 +1130,21 @@ export class PlayerController {
   }
 
   private handleGrenadeInput(dt: number): void {
+    const quickTap = this.input.consumeKeyPress('KeyG');
     const quickPress = this.input.isKeyDown('KeyG');
     const armedLmb = this.weaponId === 'grenade' && this.input.isLeftMouseDown();
+
+    if (
+      this.input.isTouchActive() &&
+      quickTap &&
+      !quickPress &&
+      !this.cookingGrenade &&
+      this.reserveAmmo.grenade > 0 &&
+      !this.mgMounted
+    ) {
+      this.throwGrenade(2.65);
+      return;
+    }
 
     if ((quickPress || armedLmb) && !this.cookingGrenade && this.reserveAmmo.grenade > 0 && !this.mgMounted) {
       this.cookingGrenade = true;
@@ -1252,8 +1286,9 @@ export class PlayerController {
       }
     }
 
-    this.recoilOffsetPitch += stats.recoilPitch * (1 - this.adsFactor * 0.22);
-    this.recoilOffsetYaw += (Math.random() - 0.5) * stats.recoilYaw;
+    const touchRecoilMult = this.input.isTouchActive() ? 0.55 : 1.0;
+    this.recoilOffsetPitch += stats.recoilPitch * (1 - this.adsFactor * 0.22) * touchRecoilMult;
+    this.recoilOffsetYaw += (Math.random() - 0.5) * stats.recoilYaw * touchRecoilMult;
   }
 
   private fireMountedMG(autoTarget: THREE.Vector3 | null = null): void {

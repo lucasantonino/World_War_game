@@ -152,6 +152,14 @@ export class UIManager {
   private touchBtnAds!: HTMLElement;
   private touchBtnSmoke!: HTMLElement;
   private touchBtnBino!: HTMLElement;
+  private touchBtnCrouch!: HTMLElement;
+  private touchBtnJump!: HTMLElement;
+  private touchBtnHeal!: HTMLElement;
+  private touchBtnReload!: HTMLElement;
+  private touchBtnMelee!: HTMLElement;
+  private touchBtnGrenade!: HTMLElement;
+  private touchBtnWeapon!: HTMLElement;
+  private touchBtnFire!: HTMLElement;
   private goreWarningBannerEl!: HTMLElement;
   private orientationWarnEl!: HTMLElement;
   private dismissedPortraitWarning = false;
@@ -543,7 +551,40 @@ export class UIManager {
 
     this.controlsToastEl.classList.toggle('hidden', state.touchActive || !state.showControlsHint);
     this.touchControlsEl.classList.toggle('hidden', !state.touchActive);
+
+    const showInteract = Boolean(state.interactPrompt) || state.inAllyTank || state.mgMounted;
+    this.touchBtnInteract.classList.toggle('hidden', !showInteract);
     this.touchBtnInteract.classList.toggle('highlight', Boolean(state.interactPrompt));
+    this.touchBtnInteract.textContent = state.inAllyTank
+      ? 'SAIR TANQUE'
+      : state.mgMounted
+        ? 'SAIR MG'
+        : 'INTERAGIR';
+
+    const needsHeal = state.bandages > 0 && (state.bleeding || state.hp < 75);
+    this.touchBtnHeal.classList.toggle('danger-pulse', needsHeal && !state.inAllyTank);
+    this.touchBtnHeal.classList.toggle('empty', state.bandages <= 0);
+    this.touchBtnHeal.classList.toggle('hidden', state.inAllyTank);
+
+    this.touchBtnCrouch.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnCrouch.classList.toggle('active', state.isCrouching);
+    this.touchBtnJump.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnReload.classList.toggle(
+      'hidden',
+      state.inAllyTank || state.mgMounted || state.binocularsActive
+    );
+    this.touchBtnMelee.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnBino.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnGrenade.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnSmoke.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnWeapon.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+
+    this.touchBtnFire.textContent = state.inAllyTank
+      ? 'CANHÃO'
+      : state.binocularsActive
+        ? 'ARTILHARIA'
+        : 'ATIRAR';
+    this.touchBtnAds.textContent = state.inAllyTank ? 'COAXIAL' : 'MIRAR';
     this.touchBtnAds.classList.toggle('active', state.adsFactor > 0.4);
     this.touchBtnSmoke.classList.toggle('empty', state.smokeGrenades <= 0);
     this.touchBtnBino.classList.toggle('active', state.binocularsActive);
@@ -896,17 +937,20 @@ export class UIManager {
             <button id="touch-btn-crouch" type="button" class="touch-btn">AGACHAR</button>
             <button id="touch-btn-jump" type="button" class="touch-btn">ESCALAR</button>
             <button id="touch-btn-heal" type="button" class="touch-btn">CURATIVO</button>
-            <button id="touch-btn-interact" type="button" class="touch-btn">INTERAGIR</button>
-            <button id="touch-btn-bino" type="button" class="touch-btn">BINÓCULO</button>
-            <button id="touch-btn-melee" type="button" class="touch-btn">BAIONETA</button>
           </div>
 
+          <button id="touch-btn-interact" type="button" class="touch-btn touch-btn-interact hidden">
+            INTERAGIR
+          </button>
+
           <div class="touch-cluster-right">
-            <button id="touch-btn-ads" type="button" class="touch-btn">MIRAR</button>
-            <button id="touch-btn-reload" type="button" class="touch-btn">RECARREGAR</button>
-            <button id="touch-btn-weapon" type="button" class="touch-btn">ARMA</button>
-            <button id="touch-btn-grenade" type="button" class="touch-btn">GRANADA</button>
+            <button id="touch-btn-bino" type="button" class="touch-btn">BINÓCULO</button>
             <button id="touch-btn-smoke" type="button" class="touch-btn">FUMAÇA</button>
+            <button id="touch-btn-grenade" type="button" class="touch-btn">GRANADA</button>
+            <button id="touch-btn-weapon" type="button" class="touch-btn">ARMA</button>
+            <button id="touch-btn-reload" type="button" class="touch-btn">RECARREGAR</button>
+            <button id="touch-btn-melee" type="button" class="touch-btn">BAIONETA</button>
+            <button id="touch-btn-ads" type="button" class="touch-btn">MIRAR</button>
             <button id="touch-btn-fire" type="button" class="touch-btn fire">ATIRAR</button>
           </div>
         </div>
@@ -980,6 +1024,14 @@ export class UIManager {
     this.touchBtnAds = this.root.querySelector('#touch-btn-ads')!;
     this.touchBtnSmoke = this.root.querySelector('#touch-btn-smoke')!;
     this.touchBtnBino = this.root.querySelector('#touch-btn-bino')!;
+    this.touchBtnCrouch = this.root.querySelector('#touch-btn-crouch')!;
+    this.touchBtnJump = this.root.querySelector('#touch-btn-jump')!;
+    this.touchBtnHeal = this.root.querySelector('#touch-btn-heal')!;
+    this.touchBtnReload = this.root.querySelector('#touch-btn-reload')!;
+    this.touchBtnMelee = this.root.querySelector('#touch-btn-melee')!;
+    this.touchBtnGrenade = this.root.querySelector('#touch-btn-grenade')!;
+    this.touchBtnWeapon = this.root.querySelector('#touch-btn-weapon')!;
+    this.touchBtnFire = this.root.querySelector('#touch-btn-fire')!;
     this.goreWarningBannerEl = this.root.querySelector('#gore-warning-banner')!;
     this.orientationWarnEl = this.root.querySelector('#orientation-warning')!;
     this.opsHeadingCountEl = this.root.querySelector('#ops-heading-count')!;
@@ -1262,6 +1314,8 @@ export class UIManager {
     const pauseBtn = this.root.querySelector('#touch-btn-pause') as HTMLElement;
 
     let joyPointerId: number | null = null;
+    let joyOriginX = 0;
+    let joyOriginY = 0;
     let lookPointerId: number | null = null;
     let lastLookX = 0;
     let lastLookY = 0;
@@ -1270,15 +1324,14 @@ export class UIManager {
     let lastFireY = 0;
 
     const heldButtons = new Map<number, { el: HTMLElement; onRelease: () => void }>();
+    const dragLookPointers = new Map<number, { x: number; y: number }>();
 
     const updateJoystick = (clientX: number, clientY: number) => {
       const rect = joyBase.getBoundingClientRect();
-      const centerX = rect.left + rect.width * 0.5;
-      const centerY = rect.top + rect.height * 0.5;
-      const maxRadius = Math.max(36, rect.width * 0.44);
+      const maxRadius = Math.max(34, rect.width * 0.44);
 
-      const dx = clientX - centerX;
-      const dy = clientY - centerY;
+      const dx = clientX - joyOriginX;
+      const dy = clientY - joyOriginY;
       const dist = Math.hypot(dx, dy);
 
       let nx = dx;
@@ -1291,19 +1344,21 @@ export class UIManager {
       joyKnob.style.transform = `translate(calc(-50% + ${nx.toFixed(1)}px), calc(-50% + ${ny.toFixed(1)}px))`;
 
       const ratio = dist / maxRadius;
-      if (ratio < 0.14) {
+      if (ratio < 0.12) {
         this.callbacks.onTouchMove(0, 0, false);
         return;
       }
 
       const moveX = nx / maxRadius;
       const moveY = -ny / maxRadius;
-      const sprinting = moveY > 0.78 && ratio > 0.85;
+      const sprinting = moveY > 0.72 && ratio > 0.82;
       this.callbacks.onTouchMove(moveX, moveY, sprinting);
     };
 
     const resetJoystick = () => {
       joyPointerId = null;
+      joyBase.style.left = '50%';
+      joyBase.style.top = '50%';
       joyKnob.style.transform = 'translate(-50%, -50%)';
       this.callbacks.onTouchMove(0, 0, false);
     };
@@ -1313,6 +1368,7 @@ export class UIManager {
         resetJoystick();
       }
       lookPointerId = null;
+      dragLookPointers.clear();
       if (firePointerId !== null) {
         firePointerId = null;
         fireBtn.classList.remove('active');
@@ -1334,6 +1390,19 @@ export class UIManager {
       e.stopPropagation();
       if (joyPointerId !== null) return;
       joyPointerId = e.pointerId;
+      try {
+        joyZone.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore capture errors in synthetic contexts
+      }
+      const zRect = joyZone.getBoundingClientRect();
+      const pad = 42;
+      const localX = Math.max(pad, Math.min(zRect.width - pad, e.clientX - zRect.left));
+      const localY = Math.max(pad, Math.min(zRect.height - pad, e.clientY - zRect.top));
+      joyBase.style.left = `${localX.toFixed(1)}px`;
+      joyBase.style.top = `${localY.toFixed(1)}px`;
+      joyOriginX = zRect.left + localX;
+      joyOriginY = zRect.top + localY;
       updateJoystick(e.clientX, e.clientY);
     });
 
@@ -1341,6 +1410,11 @@ export class UIManager {
       e.preventDefault();
       if (lookPointerId !== null) return;
       lookPointerId = e.pointerId;
+      try {
+        lookZone.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore capture errors in synthetic contexts
+      }
       lastLookX = e.clientX;
       lastLookY = e.clientY;
     });
@@ -1350,17 +1424,25 @@ export class UIManager {
       e.stopPropagation();
       if (firePointerId !== null) return;
       firePointerId = e.pointerId;
+      try {
+        fireBtn.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore capture errors
+      }
       lastFireX = e.clientX;
       lastFireY = e.clientY;
       fireBtn.classList.add('active');
       this.callbacks.onTouchFire(true);
     });
 
-    const bindTapButton = (selector: string, onTap: () => void) => {
+    const bindTapButton = (selector: string, onTap: () => void, allowDragLook = false) => {
       const btn = this.root.querySelector(selector) as HTMLElement;
       btn.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (allowDragLook) {
+          dragLookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        }
         btn.classList.add('active');
         onTap();
         window.setTimeout(() => btn.classList.remove('active'), 110);
@@ -1384,29 +1466,47 @@ export class UIManager {
 
     bindTapButton('#touch-btn-crouch', () => this.callbacks.onTouchKeyPress('KeyC'));
     bindHoldButton('#touch-btn-jump', 'Space');
-    bindHoldButton('#touch-btn-heal', 'KeyH');
+    bindTapButton('#touch-btn-heal', () => this.callbacks.onTouchKeyPress('KeyH'));
     bindTapButton('#touch-btn-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
+    bindTapButton('#hud-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
+    bindTapButton('#bino-telemetry', () => {
+      this.callbacks.onTouchFire(true);
+      window.setTimeout(() => this.callbacks.onTouchFire(false), 60);
+    });
     bindTapButton('#touch-btn-bino', () => {
       if (this.onTouchBinoculars) this.onTouchBinoculars();
       else if (this.callbacks.onTouchBinoculars) this.callbacks.onTouchBinoculars();
       else this.callbacks.onTouchKeyPress('KeyB');
-    });
+    }, true);
     bindTapButton('#touch-btn-melee', () => {
       if (this.onTouchMelee) this.onTouchMelee();
       else if (this.callbacks.onTouchMelee) this.callbacks.onTouchMelee();
       else this.callbacks.onTouchKeyPress('KeyV');
-    });
+    }, true);
 
     this.touchBtnAds.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      this.callbacks.onTouchAdsToggle();
+      dragLookPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const inTank = !this.tankHudEl.classList.contains('hidden');
+      if (inTank) {
+        if (!heldButtons.has(e.pointerId)) {
+          this.touchBtnAds.classList.add('active');
+          this.callbacks.onTouchKeyHold('Space', true);
+          heldButtons.set(e.pointerId, {
+            el: this.touchBtnAds,
+            onRelease: () => this.callbacks.onTouchKeyHold('Space', false)
+          });
+        }
+      } else {
+        this.callbacks.onTouchAdsToggle();
+      }
     });
 
-    bindTapButton('#touch-btn-reload', () => this.callbacks.onTouchKeyPress('KeyR'));
-    bindHoldButton('#touch-btn-grenade', 'KeyG');
-    bindTapButton('#touch-btn-smoke', () => this.onTouchSmoke?.());
-    bindTapButton('#touch-btn-weapon', () => this.callbacks.onTouchCycleWeapon());
+    bindTapButton('#touch-btn-reload', () => this.callbacks.onTouchKeyPress('KeyR'), true);
+    bindTapButton('#touch-btn-grenade', () => this.callbacks.onTouchKeyPress('KeyG'), true);
+    bindTapButton('#touch-btn-smoke', () => this.onTouchSmoke?.(), true);
+    bindTapButton('#touch-btn-weapon', () => this.callbacks.onTouchCycleWeapon(), true);
 
     pauseBtn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
@@ -1433,9 +1533,20 @@ export class UIManager {
         lastFireY = e.clientY;
         this.callbacks.onTouchLook(dx, dy);
       }
+      const dragEntry = dragLookPointers.get(e.pointerId);
+      if (dragEntry) {
+        const dx = e.clientX - dragEntry.x;
+        const dy = e.clientY - dragEntry.y;
+        dragEntry.x = e.clientX;
+        dragEntry.y = e.clientY;
+        if (Math.hypot(dx, dy) > 1.5) {
+          this.callbacks.onTouchLook(dx, dy);
+        }
+      }
     });
 
     const handlePointerEnd = (e: PointerEvent) => {
+      dragLookPointers.delete(e.pointerId);
       if (e.pointerId === joyPointerId) {
         resetJoystick();
       }
