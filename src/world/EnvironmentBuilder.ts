@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { getProceduralTextures } from '../engine/Textures';
-import { DestructibleSpec, DestructionStage, MissionConfig, QualityLevel } from '../types';
+import { DestructibleSpec, DestructionStage, MissionConfig, MissionEnvironment, QualityLevel } from '../types';
 import { CoverSystem } from './CoverSystem';
 import { Terrain } from './Terrain';
 
@@ -37,7 +37,25 @@ export class EnvironmentBuilder {
   private sunLight: THREE.DirectionalLight | null = null;
   private hemiLight: THREE.HemisphereLight | null = null;
   private skyMesh: THREE.Mesh | null = null;
-  private rainPoints: THREE.Points | null = null;
+  private skyUniforms: {
+    uTop: { value: THREE.Color };
+    uHorizon: { value: THREE.Color };
+    uFlash: { value: number };
+    uFlashDir: { value: THREE.Vector3 };
+    uFlashColor: { value: THREE.Color };
+  } | null = null;
+  private horizonFlashMesh: THREE.Mesh | null = null;
+  private weatherPoints: THREE.Points | null = null;
+  private weatherVelocities: Float32Array | null = null;
+  private isRainWeather = false;
+  private weatherBaseOpacity = 0.42;
+  private weatherElapsed = 0;
+  private baseFogDensity = 0.015;
+  private baseSunIntensity = 1.0;
+  private baseHemiIntensity = 0.6;
+  private artilleryFlashTimer = 5.0;
+  private artilleryFlashPulse = 0;
+  private artilleryDoublePending = false;
 
   constructor(scene: THREE.Scene, terrain: Terrain, cover: CoverSystem) {
     this.scene = scene;
@@ -54,7 +72,16 @@ export class EnvironmentBuilder {
     this.trenchStakes = [];
     this.dugoutVisuals.clear();
     this.bunkerMainGroup = null;
-    this.rainPoints = null;
+    this.sunLight = null;
+    this.hemiLight = null;
+    this.skyMesh = null;
+    this.skyUniforms = null;
+    this.horizonFlashMesh = null;
+    this.weatherPoints = null;
+    this.weatherVelocities = null;
+    this.weatherElapsed = 0;
+    this.artilleryFlashPulse = 0;
+    this.artilleryDoublePending = false;
     this.timberMat = null;
     this.mudCollapseMat = null;
 
@@ -84,11 +111,21 @@ export class EnvironmentBuilder {
     this.clear();
 
     const env = config.environment;
+    this.baseFogDensity = env.fogDensity;
+    this.baseSunIntensity = env.sunIntensity;
+    this.baseHemiIntensity = env.ambientIntensity;
+    this.isRainWeather = env.hasRain;
+    this.weatherElapsed = 0;
+    this.artilleryFlashTimer = 3.2 + Math.random() * 5.0;
+    this.artilleryFlashPulse = 0;
+    this.artilleryDoublePending = false;
+
     this.scene.fog = new THREE.FogExp2(env.fogColor, env.fogDensity);
     this.scene.background = new THREE.Color(env.skyHorizon);
 
-    // Sky Dome
-    this.buildSkyDome(env.skyTop, env.skyHorizon);
+    // Sky Dome + distant artillery horizon flash billboard
+    this.buildSkyDome(env.skyTop, env.skyHorizon, env.isNight);
+    this.buildHorizonFlashMesh(env.isNight);
 
     // Lighting (strict light budget <= 8 total scene lights)
     this.hemiLight = new THREE.HemisphereLight(env.ambientColor, 0x261e17, env.ambientIntensity);
@@ -144,8 +181,11 @@ export class EnvironmentBuilder {
       metalness: 0.02
     });
 
-    // 1. Trenches (duckboards, timber walls, destructible sandbag parapets)
-    this.buildTrenches(config, timberMat, sandbagMat);
+    // 1. Trenches (duckboards, continuous timber plank walls, destructible sandbag parapets)
+    this.buildTrenches(config, timberMat, sandbagMat, tex.timber);
+
+    // 1b. Reflective mud puddles in trench floors & craters (no extra PointLights)
+    this.buildMudPuddles(config);
 
     // 2. Dugouts (safe overhead shelters with warm lantern light)
     this.buildDugouts(config, timberMat, sandbagMat);
@@ -174,13 +214,12 @@ export class EnvironmentBuilder {
     // 8. Interactables (Ammo, Medic, Radio, Bunker Charge point)
     this.buildInteractables(config, tex, timberMat);
 
-    // 9. Shattered dead trees fallback & anti-tank hedgehogs
+    // 9. Shattered dead trees fallback, anti-tank hedgehogs & battlefield clutter props
     this.buildBattlefieldAtmosphereProps(config, timberMat, steelMat);
+    this.buildBattlefieldDetails(config, timberMat, steelMat);
 
-    // 10. Atmospheric effects (Rain, Flares, Searchlights)
-    if (env.hasRain) {
-      this.buildRain();
-    }
+    // 10. Atmospheric effects (Rain or Battle Ash/Embers, Flares, Searchlights)
+    this.buildWeatherParticles(env, quality);
     if (env.hasFlares) {
       this.buildFlares(env.isNight);
     }
@@ -189,15 +228,19 @@ export class EnvironmentBuilder {
     }
   }
 
-  private buildSkyDome(topHex: number, horizonHex: number): void {
+  private buildSkyDome(topHex: number, horizonHex: number, isNight: boolean): void {
     const geo = new THREE.SphereGeometry(170, 24, 16);
+    this.skyUniforms = {
+      uTop: { value: new THREE.Color(topHex) },
+      uHorizon: { value: new THREE.Color(horizonHex) },
+      uFlash: { value: 0 },
+      uFlashDir: { value: new THREE.Vector3(0.0, 0.08, -1.0).normalize() },
+      uFlashColor: { value: new THREE.Color(isNight ? 0xffb36b : 0xff9a52) }
+    };
     const mat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
-      uniforms: {
-        uTop: { value: new THREE.Color(topHex) },
-        uHorizon: { value: new THREE.Color(horizonHex) }
-      },
+      uniforms: this.skyUniforms,
       vertexShader: `
         varying vec3 vWorldPos;
         void main() {
@@ -209,10 +252,18 @@ export class EnvironmentBuilder {
       fragmentShader: `
         uniform vec3 uTop;
         uniform vec3 uHorizon;
+        uniform float uFlash;
+        uniform vec3 uFlashDir;
+        uniform vec3 uFlashColor;
         varying vec3 vWorldPos;
         void main() {
-          float h = clamp(normalize(vWorldPos).y * 1.45, 0.0, 1.0);
-          gl_FragColor = vec4(mix(uHorizon, uTop, pow(h, 0.72)), 1.0);
+          vec3 dir = normalize(vWorldPos);
+          float h = clamp(dir.y * 1.45, 0.0, 1.0);
+          vec3 baseCol = mix(uHorizon, uTop, pow(h, 0.72));
+          float dirGlow = pow(max(dot(dir, normalize(uFlashDir)), 0.0), 5.0);
+          float horizonBand = 1.0 - smoothstep(0.0, 0.48, h);
+          baseCol += uFlashColor * dirGlow * horizonBand * uFlash * 0.95;
+          gl_FragColor = vec4(baseCol, 1.0);
         }
       `
     });
@@ -220,12 +271,88 @@ export class EnvironmentBuilder {
     this.rootGroup.add(this.skyMesh);
   }
 
+  private buildHorizonFlashMesh(isNight: boolean): void {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      const grad = ctx.createRadialGradient(32, 32, 2, 32, 32, 32);
+      grad.addColorStop(0, isNight ? 'rgba(255, 224, 175, 0.95)' : 'rgba(255, 200, 140, 0.85)');
+      grad.addColorStop(0.35, 'rgba(255, 138, 66, 0.45)');
+      grad.addColorStop(1, 'rgba(255, 100, 40, 0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 64, 64);
+    }
+    const tex = new THREE.CanvasTexture(canvas);
+    this.disposableTextures.push(tex);
+    const mat = new THREE.MeshBasicMaterial({
+      map: tex,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      fog: false,
+      blending: THREE.AdditiveBlending
+    });
+    this.horizonFlashMesh = new THREE.Mesh(new THREE.PlaneGeometry(44, 24), mat);
+    this.horizonFlashMesh.position.set(0, 8, -125);
+    this.horizonFlashMesh.visible = false;
+    this.rootGroup.add(this.horizonFlashMesh);
+  }
+
+  private pointToSegmentDist(px: number, pz: number, x1: number, z1: number, x2: number, z2: number): number {
+    const vx = x2 - x1;
+    const vz = z2 - z1;
+    const lenSq = vx * vx + vz * vz;
+    if (lenSq < 1e-6) return Math.hypot(px - x1, pz - z1);
+    const t = Math.max(0, Math.min(1, ((px - x1) * vx + (pz - z1) * vz) / lenSq));
+    return Math.hypot(px - (x1 + vx * t), pz - (z1 + vz * t));
+  }
+
+  private isWallOpening(wx: number, wz: number, trenchId: string, config: MissionConfig): boolean {
+    for (const r of config.ramps) {
+      if (this.pointToSegmentDist(wx, wz, r.x1, r.z1, r.x2, r.z2) < r.width * 0.65) {
+        return true;
+      }
+    }
+    for (const d of config.dugouts) {
+      const doorZ = d.openSide === 'north' ? d.z - d.depth * 0.5 : d.z + d.depth * 0.5;
+      if (Math.abs(wx - d.x) < d.width * 0.48 && Math.abs(wz - doorZ) < 1.9) {
+        return true;
+      }
+    }
+    for (const other of config.trenches) {
+      if (other.id === trenchId) continue;
+      if (this.pointToSegmentDist(wx, wz, other.x1, other.z1, other.x2, other.z2) < other.width * 0.48) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private buildTrenches(
     config: MissionConfig,
     timberMat: THREE.Material,
-    sandbagMat: THREE.Material
+    sandbagMat: THREE.Material,
+    timberTex: THREE.Texture
   ): void {
     let bagCounter = 0;
+
+    // Mud-darkened timber revetment materials (non-colliding visual sheathing)
+    const mudPlankMat = new THREE.MeshStandardMaterial({
+      map: timberTex,
+      color: 0x62503e,
+      roughness: 0.92,
+      metalness: 0.04
+    });
+    const mudLowerPlankMat = new THREE.MeshStandardMaterial({
+      map: timberTex,
+      color: 0x3b2f24,
+      roughness: 0.96,
+      metalness: 0.03
+    });
+    const plankUnitGeo = new THREE.BoxGeometry(0.06, 0.24, 1);
+    const railUnitGeo = new THREE.BoxGeometry(0.11, 0.09, 1);
 
     for (const tr of config.trenches) {
       const dx = tr.x2 - tr.x1;
@@ -251,23 +378,68 @@ export class EnvironmentBuilder {
         }
       }
 
-      // Timber revetment wall stakes along trench edges
+      // Timber revetment vertical stakes & continuous horizontal plank wall sheathing
       const stakes = Math.max(3, Math.floor(len / 2.2));
+      const segLen = len / stakes;
       const perpX = Math.cos(angle);
       const perpZ = -Math.sin(angle);
+      const wallOffset = tr.width * 0.52;
+      const wallHeight = Math.max(0.95, tr.depth);
+
       for (let i = 0; i <= stakes; i++) {
         const t = i / stakes;
         const px = tr.x1 + dx * t;
         const pz = tr.z1 + dz * t;
         for (const side of [-1, 1]) {
-          const sx = px + perpX * (tr.width * 0.52) * side;
-          const sz = pz + perpZ * (tr.width * 0.52) * side;
+          const sx = px + perpX * wallOffset * side;
+          const sz = pz + perpZ * wallOffset * side;
+          if (this.isWallOpening(sx, sz, tr.id, config)) continue;
           const sy = this.terrain.getTerrainHeight(sx, sz);
-          const post = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1.35, 0.14), timberMat);
+          const post = new THREE.Mesh(new THREE.BoxGeometry(0.14, 1.35, 0.14), mudLowerPlankMat);
           post.position.set(sx, sy + 0.35, sz);
+          post.rotation.y = angle;
           post.castShadow = true;
+          post.receiveShadow = true;
           this.rootGroup.add(post);
           this.trenchStakes.push({ x: sx, z: sz, mesh: post, collapsed: false });
+        }
+      }
+
+      // Continuous horizontal wood plank tiers + top crossbeam along trench walls (no collision)
+      const plankOffset = tr.width * 0.55;
+      for (let i = 0; i < stakes; i++) {
+        const tMid = (i + 0.5) / stakes;
+        const px = tr.x1 + dx * tMid;
+        const pz = tr.z1 + dz * tMid;
+        const floorY = this.terrain.getTerrainHeight(px, pz);
+
+        for (const side of [-1, 1]) {
+          const wx = px + perpX * plankOffset * side;
+          const wz = pz + perpZ * plankOffset * side;
+          if (this.isWallOpening(wx, wz, tr.id, config)) continue;
+
+          // 3 horizontal plank courses darkened near mud floor
+          const tiers: Array<{ yFrac: number; mat: THREE.Material }> = [
+            { yFrac: 0.16, mat: mudLowerPlankMat },
+            { yFrac: 0.44, mat: mudLowerPlankMat },
+            { yFrac: 0.72, mat: mudPlankMat }
+          ];
+          for (const tier of tiers) {
+            const plank = new THREE.Mesh(plankUnitGeo, tier.mat);
+            plank.scale.set(1, 1, segLen + 0.04);
+            plank.position.set(wx, floorY + wallHeight * tier.yFrac, wz);
+            plank.rotation.y = angle;
+            plank.receiveShadow = true;
+            this.rootGroup.add(plank);
+          }
+
+          // Upper horizontal ledger rail along the parapet rim
+          const topRail = new THREE.Mesh(railUnitGeo, mudPlankMat);
+          topRail.scale.set(1, 1, segLen + 0.04);
+          topRail.position.set(wx, floorY + wallHeight * 0.94, wz);
+          topRail.rotation.y = angle;
+          topRail.receiveShadow = true;
+          this.rootGroup.add(topRail);
         }
       }
 
@@ -349,6 +521,56 @@ export class EnvironmentBuilder {
             }
           });
         }
+      }
+    }
+  }
+
+  private buildMudPuddles(config: MissionConfig): void {
+    const puddleMat = new THREE.MeshStandardMaterial({
+      color: 0x1b211d,
+      roughness: 0.08,
+      metalness: 0.35
+    });
+    const puddleGeo = new THREE.CircleGeometry(1, 16);
+    puddleGeo.rotateX(-Math.PI * 0.5);
+
+    // Reflective mud puddles inside crater basins
+    for (let i = 0; i < config.initialCraters.length; i++) {
+      const c = config.initialCraters[i];
+      if (c.radius < 1.9) continue;
+      const cy = this.terrain.getTerrainHeight(c.x, c.z);
+      const r = Math.max(0.62, c.radius * 0.42);
+      const puddle = new THREE.Mesh(puddleGeo, puddleMat);
+      puddle.scale.set(r, 1, r * (0.88 + (i % 3) * 0.08));
+      puddle.position.set(c.x, cy + 0.038, c.z);
+      puddle.rotation.y = (i * 0.9) % Math.PI;
+      puddle.receiveShadow = true;
+      this.rootGroup.add(puddle);
+    }
+
+    // Reflective puddles along muddy trench floors (below/between duckboards, zero collision)
+    for (const tr of config.trenches) {
+      const dx = tr.x2 - tr.x1;
+      const dz = tr.z2 - tr.z1;
+      const len = Math.hypot(dx, dz);
+      const angle = Math.atan2(dx, dz);
+      const perpX = Math.cos(angle);
+      const perpZ = -Math.sin(angle);
+      const puddleCount = Math.max(1, Math.floor(len / 7.0));
+
+      for (let i = 0; i < puddleCount; i++) {
+        const t = (i + 0.35) / puddleCount;
+        const sideShift = ((i % 2 === 0 ? 1 : -1) * tr.width) * 0.22;
+        const px = tr.x1 + dx * t + perpX * sideShift;
+        const pz = tr.z1 + dz * t + perpZ * sideShift;
+        const py = this.terrain.getTerrainHeight(px, pz);
+
+        const puddle = new THREE.Mesh(puddleGeo, puddleMat);
+        puddle.scale.set(0.46, 1, 0.85);
+        puddle.position.set(px, py + 0.025, pz);
+        puddle.rotation.y = angle + (i % 2 ? 0.15 : -0.12);
+        puddle.receiveShadow = true;
+        this.rootGroup.add(puddle);
       }
     }
   }
@@ -1211,37 +1433,253 @@ export class EnvironmentBuilder {
     }
   }
 
-  private buildRain(): void {
-    const count = 900;
-    const positions = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * 90;
-      positions[i * 3 + 1] = Math.random() * 28;
-      positions[i * 3 + 2] = (Math.random() - 0.5) * 90;
+  private isPropSpotClear(x: number, z: number, config: MissionConfig, minTrenchMargin = 0.4): boolean {
+    for (const inter of config.interactables) {
+      if (Math.hypot(x - inter.x, z - inter.z) < 2.6) return false;
     }
+    for (const r of config.ramps) {
+      if (this.pointToSegmentDist(x, z, r.x1, r.z1, r.x2, r.z2) < r.width * 0.8) return false;
+    }
+    for (const d of config.dugouts) {
+      if (Math.abs(x - d.x) < d.width * 0.7 && Math.abs(z - d.z) < d.depth * 0.8) return false;
+    }
+    for (const tr of config.trenches) {
+      if (this.pointToSegmentDist(x, z, tr.x1, tr.z1, tr.x2, tr.z2) < tr.width * minTrenchMargin) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private buildBattlefieldDetails(
+    config: MissionConfig,
+    timberMat: THREE.Material,
+    steelMat: THREE.Material
+  ): void {
+    // Generic weathered war materials — zero extremist/political insignias
+    const helmetMat = new THREE.MeshStandardMaterial({
+      color: 0x3b4238,
+      roughness: 0.72,
+      metalness: 0.35
+    });
+    const rustMat = new THREE.MeshStandardMaterial({
+      color: 0x4f3023,
+      roughness: 0.88,
+      metalness: 0.42
+    });
+    const uniformMudMat = new THREE.MeshStandardMaterial({
+      color: 0x3b382e,
+      roughness: 0.94,
+      metalness: 0.04
+    });
+
+    const addFallenHelmet = (hx: number, hz: number, rotY: number) => {
+      const hy = this.terrain.getTerrainHeight(hx, hz);
+      const hg = new THREE.Group();
+      hg.position.set(hx, hy + 0.02, hz);
+      hg.rotation.set(0.28, rotY, -0.22);
+      const dome = new THREE.Mesh(
+        new THREE.SphereGeometry(0.17, 10, 8, 0, Math.PI * 2, 0, Math.PI * 0.54),
+        helmetMat
+      );
+      dome.castShadow = true;
+      hg.add(dome);
+      const brim = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.185, 0.21, 0.03, 10, 1, true),
+        helmetMat
+      );
+      brim.position.y = 0.01;
+      hg.add(brim);
+      this.rootGroup.add(hg);
+    };
+
+    const addBrokenCrate = (cx: number, cz: number, rotY: number) => {
+      const cy = this.terrain.getTerrainHeight(cx, cz);
+      const cg = new THREE.Group();
+      cg.position.set(cx, cy + 0.16, cz);
+      cg.rotation.set(0.08, rotY, -0.14);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.38, 0.46), timberMat);
+      body.castShadow = true;
+      body.receiveShadow = true;
+      cg.add(body);
+      const slat = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.04, 0.12), timberMat);
+      slat.position.set(0.1, 0.22, 0.15);
+      slat.rotation.set(0.2, 0.45, -0.24);
+      cg.add(slat);
+      this.rootGroup.add(cg);
+    };
+
+    const addWheelbarrow = (wx: number, wz: number, rotY: number) => {
+      const wy = this.terrain.getTerrainHeight(wx, wz);
+      const wg = new THREE.Group();
+      wg.position.set(wx, wy + 0.22, wz);
+      wg.rotation.set(0.05, rotY, 0.32);
+      const tray = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.24, 0.74), timberMat);
+      tray.castShadow = true;
+      tray.receiveShadow = true;
+      wg.add(tray);
+      for (const side of [-0.22, 0.22]) {
+        const handle = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 1.28), timberMat);
+        handle.position.set(side, -0.06, 0.14);
+        wg.add(handle);
+      }
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.06, 10), steelMat);
+      wheel.rotation.z = Math.PI * 0.5;
+      wheel.position.set(0, -0.12, -0.48);
+      wheel.castShadow = true;
+      wg.add(wheel);
+      this.rootGroup.add(wg);
+    };
+
+    const addRustedDrum = (dx: number, dz: number, tipped: boolean, rotY: number) => {
+      const dy = this.terrain.getTerrainHeight(dx, dz);
+      const dg = new THREE.Group();
+      dg.position.set(dx, dy + (tipped ? 0.28 : 0.43), dz);
+      dg.rotation.set(tipped ? Math.PI * 0.46 : 0.04, rotY, tipped ? 0.18 : -0.05);
+      const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.29, 0.29, 0.86, 12), rustMat);
+      drum.castShadow = true;
+      drum.receiveShadow = true;
+      dg.add(drum);
+      for (const ribY of [-0.18, 0.18]) {
+        const rib = new THREE.Mesh(new THREE.CylinderGeometry(0.305, 0.305, 0.04, 12), rustMat);
+        rib.position.y = ribY;
+        dg.add(rib);
+      }
+      this.rootGroup.add(dg);
+    };
+
+    const addFallenSilhouette = (sx: number, sz: number, rotY: number) => {
+      const sy = this.terrain.getTerrainHeight(sx, sz);
+      const sg = new THREE.Group();
+      sg.position.set(sx, sy + 0.04, sz);
+      sg.rotation.y = rotY;
+      const torso = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.15, 0.58), uniformMudMat);
+      torso.position.y = 0.05;
+      torso.receiveShadow = true;
+      sg.add(torso);
+      const legs = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.12, 0.56), uniformMudMat);
+      legs.position.set(0.03, 0.03, 0.5);
+      legs.rotation.y = 0.14;
+      sg.add(legs);
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.1, 0.42), uniformMudMat);
+      arm.position.set(-0.26, 0.03, -0.06);
+      arm.rotation.y = -0.45;
+      sg.add(arm);
+      const helmet = new THREE.Mesh(
+        new THREE.SphereGeometry(0.14, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55),
+        helmetMat
+      );
+      helmet.position.set(0.05, 0.07, -0.35);
+      helmet.rotation.x = -0.25;
+      sg.add(helmet);
+      this.rootGroup.add(sg);
+    };
+
+    // Scatter helmets & silhouettes along crater rims in No Man's Land
+    for (let i = 0; i < config.initialCraters.length; i++) {
+      const c = config.initialCraters[i];
+      const ang = i * 1.7 + 0.4;
+      const hx = c.x + Math.cos(ang) * (c.radius * 0.72);
+      const hz = c.z + Math.sin(ang) * (c.radius * 0.72);
+      if (this.isPropSpotClear(hx, hz, config, 0.55)) {
+        addFallenHelmet(hx, hz, ang);
+      }
+
+      if (i % 3 === 1) {
+        const sx = c.x - Math.cos(ang) * (c.radius * 0.85);
+        const sz = c.z - Math.sin(ang) * (c.radius * 0.85);
+        if (this.isPropSpotClear(sx, sz, config, 0.65)) {
+          addFallenSilhouette(sx, sz, ang + 0.8);
+        }
+      }
+    }
+
+    // Trench flank crates, wheelbarrows & rusted drums (always outside walkable centerline)
+    const crateSpots: Array<[number, number, number]> = [
+      [-10.5, 32.1, 0.4],
+      [11.2, 32.1, -0.6],
+      [-21.5, 33.4, 0.9],
+      [20.8, 33.4, -0.3],
+      [-7.2, 27.6, 0.25]
+    ];
+    for (const [cx, cz, rot] of crateSpots) {
+      if (this.isPropSpotClear(cx, cz, config, 0.58)) {
+        addBrokenCrate(cx, cz, rot);
+      }
+    }
+
+    const cartSpots: Array<[number, number, number]> = [
+      [-13.5, 34.4, 0.75],
+      [13.8, 34.2, -0.95]
+    ];
+    for (const [wx, wz, rot] of cartSpots) {
+      if (this.isPropSpotClear(wx, wz, config, 0.62)) {
+        addWheelbarrow(wx, wz, rot);
+      }
+    }
+
+    const drumSpots: Array<[number, number, boolean, number]> = [
+      [-24.5, 35.8, false, 0.2],
+      [-25.3, 35.5, true, 1.1],
+      [24.2, 35.6, false, 0.6],
+      [-19.5, 12.0, true, 0.8],
+      [20.5, 10.5, false, 0.3],
+      [21.2, 11.1, true, 2.0]
+    ];
+    for (const [dx, dz, tipped, rot] of drumSpots) {
+      if (this.isPropSpotClear(dx, dz, config, 0.62)) {
+        addRustedDrum(dx, dz, tipped, rot);
+      }
+    }
+
+    // Extra tucked helmets right inside trench corners (against wall edge, non-blocking)
+    for (let i = 0; i < config.trenches.length; i++) {
+      const tr = config.trenches[i];
+      const dx = tr.x2 - tr.x1;
+      const dz = tr.z2 - tr.z1;
+      const angle = Math.atan2(dx, dz);
+      const perpX = Math.cos(angle);
+      const perpZ = -Math.sin(angle);
+      const t = 0.22 + (i % 3) * 0.24;
+      const side = i % 2 === 0 ? 1 : -1;
+      const hx = tr.x1 + dx * t + perpX * (tr.width * 0.39) * side;
+      const hz = tr.z1 + dz * t + perpZ * (tr.width * 0.39) * side;
+      if (this.isPropSpotClear(hx, hz, config, 0.28)) {
+        addFallenHelmet(hx, hz, angle + side);
+      }
+    }
+  }
+
+  private buildWeatherParticles(env: MissionEnvironment, quality: QualityLevel): void {
+    const isRain = env.hasRain;
+    const baseCount = isRain ? 980 : 380;
+    const count = quality === 'low' ? Math.floor(baseCount * 0.5) : baseCount;
+    const positions = new Float32Array(count * 3);
+    const velocities = new Float32Array(count);
+
+    for (let i = 0; i < count; i++) {
+      positions[i * 3] = (Math.random() - 0.5) * 92;
+      positions[i * 3 + 1] = Math.random() * 27;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * 92;
+      velocities[i] = 0.78 + Math.random() * 0.44;
+    }
+
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({
-      color: 0xaab5bd,
-      size: 0.16,
-      transparent: true,
-      opacity: 0.45
-    });
-    this.rainPoints = new THREE.Points(geo, mat);
-    this.rootGroup.add(this.rainPoints);
+    this.weatherVelocities = velocities;
 
-    this.animatedProps.push({
-      update: (dt) => {
-        if (!this.rainPoints) return;
-        const pos = this.rainPoints.geometry.attributes.position as THREE.BufferAttribute;
-        for (let i = 0; i < pos.count; i++) {
-          let y = pos.getY(i) - dt * 26;
-          if (y < -1) y = 26;
-          pos.setY(i, y);
-        }
-        pos.needsUpdate = true;
-      }
+    const colorHex = isRain ? 0xaab6bf : env.isNight ? 0xb59c84 : 0x998e82;
+    this.weatherBaseOpacity = isRain ? 0.44 : 0.34;
+
+    const mat = new THREE.PointsMaterial({
+      color: colorHex,
+      size: isRain ? 0.16 : 0.13,
+      transparent: true,
+      opacity: this.weatherBaseOpacity,
+      depthWrite: false
     });
+    this.weatherPoints = new THREE.Points(geo, mat);
+    this.rootGroup.add(this.weatherPoints);
   }
 
   private buildFlares(isNight: boolean): void {
@@ -1371,9 +1809,98 @@ export class EnvironmentBuilder {
     }
   }
 
-  public update(dt: number, elapsed: number): void {
+  public update(dt: number, elapsed?: number): void {
+    this.weatherElapsed += dt;
+    const t = elapsed ?? this.weatherElapsed;
+
     for (const prop of this.animatedProps) {
-      prop.update(dt, elapsed);
+      prop.update(dt, t);
+    }
+
+    // 1. Breathing war fog density modulation
+    if (this.scene.fog && this.scene.fog instanceof THREE.FogExp2) {
+      const wave = Math.sin(this.weatherElapsed * 0.14) * 0.12 + Math.sin(this.weatherElapsed * 0.053 + 1.3) * 0.08;
+      const buildup = Math.min(0.2, this.weatherElapsed * 0.0008);
+      this.scene.fog.density = this.baseFogDensity * (1 + wave + buildup);
+    }
+
+    // 2. Wind-tilted rain / battle ash particles with gusts and intensity ramp
+    if (this.weatherPoints && this.weatherVelocities) {
+      const pos = this.weatherPoints.geometry.attributes.position as THREE.BufferAttribute;
+      const intensityRamp = Math.min(1.45, 0.85 + this.weatherElapsed * 0.004);
+      const gustX =
+        (Math.sin(this.weatherElapsed * 0.24) * 3.6 + Math.sin(this.weatherElapsed * 0.71) * 1.9 + 1.5) *
+        intensityRamp;
+      const gustZ =
+        (Math.cos(this.weatherElapsed * 0.19) * 2.2 + Math.sin(this.weatherElapsed * 0.53) * 1.1) *
+        intensityRamp;
+      const fallSpeed = this.isRainWeather ? 25.0 * intensityRamp : 1.75 * intensityRamp;
+      const windDriftScale = this.isRainWeather ? 0.9 : 0.65;
+
+      for (let i = 0; i < pos.count; i++) {
+        const vScale = this.weatherVelocities[i];
+        let x = pos.getX(i) + gustX * windDriftScale * vScale * dt;
+        let y = pos.getY(i) - fallSpeed * vScale * dt;
+        let z = pos.getZ(i) + gustZ * windDriftScale * vScale * dt;
+
+        if (!this.isRainWeather) {
+          x += Math.sin(this.weatherElapsed * 1.3 + i * 0.7) * 0.45 * dt;
+        }
+        if (y < -1) y = 26;
+        if (x > 46) x -= 92;
+        else if (x < -46) x += 92;
+        if (z > 46) z -= 92;
+        else if (z < -46) z += 92;
+
+        pos.setXYZ(i, x, y, z);
+      }
+      pos.needsUpdate = true;
+
+      const pMat = this.weatherPoints.material as THREE.PointsMaterial;
+      pMat.opacity = Math.min(0.75, this.weatherBaseOpacity * intensityRamp);
+    }
+
+    // 3. Distant horizon artillery flashes (no extra PointLights)
+    this.artilleryFlashTimer -= dt;
+    if (this.artilleryFlashTimer <= 0) {
+      this.artilleryFlashPulse = 0.85 + Math.random() * 0.35;
+      const flashX = (Math.random() - 0.5) * 150;
+      const flashZ = -115 - Math.random() * 25;
+      const flashY = 7 + Math.random() * 8;
+      if (this.skyUniforms) {
+        this.skyUniforms.uFlashDir.value.set(flashX, flashY, flashZ).normalize();
+      }
+      if (this.horizonFlashMesh) {
+        this.horizonFlashMesh.position.set(flashX, flashY, flashZ);
+        this.horizonFlashMesh.lookAt(0, 2, 20);
+        const scale = 0.85 + Math.random() * 0.55;
+        this.horizonFlashMesh.scale.set(scale, scale, 1);
+      }
+      if (!this.artilleryDoublePending && Math.random() < 0.35) {
+        this.artilleryDoublePending = true;
+        this.artilleryFlashTimer = 0.14 + Math.random() * 0.12;
+      } else {
+        this.artilleryDoublePending = false;
+        this.artilleryFlashTimer = 4.2 + Math.random() * 7.8;
+      }
+    }
+
+    if (this.artilleryFlashPulse > 0) {
+      this.artilleryFlashPulse = Math.max(0, this.artilleryFlashPulse - dt * 4.2);
+    }
+    if (this.skyUniforms) {
+      this.skyUniforms.uFlash.value = this.artilleryFlashPulse;
+    }
+    if (this.horizonFlashMesh) {
+      this.horizonFlashMesh.visible = this.artilleryFlashPulse > 0.01;
+      (this.horizonFlashMesh.material as THREE.MeshBasicMaterial).opacity =
+        Math.min(1, this.artilleryFlashPulse * 0.9);
+    }
+    if (this.hemiLight) {
+      this.hemiLight.intensity = this.baseHemiIntensity + this.artilleryFlashPulse * 0.55;
+    }
+    if (this.sunLight) {
+      this.sunLight.intensity = this.baseSunIntensity + this.artilleryFlashPulse * 0.42;
     }
   }
 }

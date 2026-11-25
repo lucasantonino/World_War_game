@@ -81,6 +81,11 @@ export class TankSystem {
       roughness: 0.58,
       metalness: 0.48
     });
+    const darkSteelMat = new THREE.MeshStandardMaterial({
+      color: 0x353833,
+      roughness: 0.52,
+      metalness: 0.62
+    });
     const trackMat = new THREE.MeshStandardMaterial({
       color: 0x1d1e1c,
       roughness: 0.9,
@@ -89,6 +94,12 @@ export class TankSystem {
     const rearGrilleMat = new THREE.MeshStandardMaterial({
       color: 0x7a2b22,
       roughness: 0.7
+    });
+    const headlightMat = new THREE.MeshStandardMaterial({
+      color: 0xfff1c4,
+      emissive: 0xffe29a,
+      emissiveIntensity: 1.15,
+      roughness: 0.25
     });
 
     const scale = heavy ? 1.18 : 0.96;
@@ -116,6 +127,31 @@ export class TankSystem {
     glacis.castShadow = true;
     hull.add(glacis);
 
+    // Driver visor slit & bow MG housing (no insignia)
+    const driverVisor = new THREE.Mesh(
+      new THREE.BoxGeometry(0.62 * scale, 0.14 * scale, 0.22 * scale),
+      darkSteelMat
+    );
+    driverVisor.position.set(-0.55 * scale, 1.18 * scale, -2.38 * scale);
+    hull.add(driverVisor);
+
+    // Front headlight (small emissive mesh, no PointLight)
+    const headlightHousing = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.13 * scale, 0.14 * scale, 0.22 * scale, 8),
+      darkSteelMat
+    );
+    headlightHousing.rotation.x = Math.PI * 0.5;
+    headlightHousing.position.set(0.88 * scale, 1.16 * scale, -2.42 * scale);
+    hull.add(headlightHousing);
+
+    const headlightLens = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.105 * scale, 0.105 * scale, 0.04 * scale, 8),
+      headlightMat
+    );
+    headlightLens.rotation.x = Math.PI * 0.5;
+    headlightLens.position.set(0.88 * scale, 1.16 * scale, -2.54 * scale);
+    hull.add(headlightLens);
+
     // Rear engine weakspot grille (facing away from front)
     const rearGrille = new THREE.Mesh(
       new THREE.BoxGeometry(1.7 * scale, 0.45 * scale, 0.25 * scale),
@@ -124,15 +160,70 @@ export class TankSystem {
     rearGrille.position.set(0, 1.05 * scale, 2.46 * scale);
     hull.add(rearGrille);
 
-    // Left & right tracks
+    // Rear auxiliary fuel drum + twin armored exhaust pipes
+    const auxFuelTank = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.24 * scale, 0.24 * scale, 1.55 * scale, 10),
+      darkSteelMat
+    );
+    auxFuelTank.rotation.z = Math.PI * 0.5;
+    auxFuelTank.position.set(0, 1.44 * scale, 2.15 * scale);
+    auxFuelTank.castShadow = true;
+    hull.add(auxFuelTank);
+
+    for (const side of [-1, 1]) {
+      const exhaust = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08 * scale, 0.095 * scale, 0.65 * scale, 8),
+        darkSteelMat
+      );
+      exhaust.position.set(side * 1.02 * scale, 1.18 * scale, 2.52 * scale);
+      exhaust.rotation.x = -0.18;
+      hull.add(exhaust);
+
+      // Rear stowage box on hull sponson
+      const stowageBox = new THREE.Mesh(
+        new THREE.BoxGeometry(0.42 * scale, 0.34 * scale, 1.1 * scale),
+        steelMat
+      );
+      stowageBox.position.set(side * 1.38 * scale, 1.34 * scale, 1.45 * scale);
+      stowageBox.castShadow = true;
+      hull.add(stowageBox);
+    }
+
+    // Left & right tracks, road wheels & armored side skirts
+    const roadWheelGeo = new THREE.CylinderGeometry(0.29 * scale, 0.29 * scale, 0.22 * scale, 10);
+    const hubGeo = new THREE.CylinderGeometry(0.11 * scale, 0.11 * scale, 0.26 * scale, 8);
+    const wheelZPositions = [-2.15, -1.32, -0.45, 0.42, 1.29, 2.15];
+
     for (const side of [-1, 1]) {
       const track = new THREE.Mesh(
-        new THREE.BoxGeometry(0.62 * scale, 0.92 * scale, 5.25 * scale),
+        new THREE.BoxGeometry(0.62 * scale, 0.86 * scale, 5.25 * scale),
         trackMat
       );
-      track.position.set(side * 1.52 * scale, 0.52 * scale, 0);
+      track.position.set(side * 1.52 * scale, 0.50 * scale, 0);
       track.castShadow = true;
       hull.add(track);
+
+      // Armored side skirts shielding upper tracks
+      const sideSkirt = new THREE.Mesh(
+        new THREE.BoxGeometry(0.12 * scale, 0.48 * scale, 4.95 * scale),
+        steelMat
+      );
+      sideSkirt.position.set(side * 1.84 * scale, 0.88 * scale, 0);
+      sideSkirt.castShadow = true;
+      hull.add(sideSkirt);
+
+      // Lower road wheels + idler/drive sprocket hubs
+      for (const wz of wheelZPositions) {
+        const wheel = new THREE.Mesh(roadWheelGeo, darkSteelMat);
+        wheel.rotation.z = Math.PI * 0.5;
+        wheel.position.set(side * 1.78 * scale, 0.33 * scale, wz * scale);
+        hull.add(wheel);
+
+        const hub = new THREE.Mesh(hubGeo, steelMat);
+        hub.rotation.z = Math.PI * 0.5;
+        hub.position.set(side * 1.79 * scale, 0.33 * scale, wz * scale);
+        hull.add(hub);
+      }
     }
 
     // Turret
@@ -146,6 +237,25 @@ export class TankSystem {
     turretBody.castShadow = true;
     turret.add(turretBody);
 
+    // Turret rear bustle stowage box
+    const turretBustle = new THREE.Mesh(
+      new THREE.BoxGeometry(1.52 * scale, 0.56 * scale, 0.62 * scale),
+      darkSteelMat
+    );
+    turretBustle.position.set(0, 0.04 * scale, 1.38 * scale);
+    turretBustle.castShadow = true;
+    turret.add(turretBustle);
+
+    // Gun mantlet (armored collar at turret front)
+    const mantlet = new THREE.Mesh(
+      new THREE.BoxGeometry(0.92 * scale, 0.54 * scale, 0.42 * scale),
+      darkSteelMat
+    );
+    mantlet.position.set(0, 0.04 * scale, -1.22 * scale);
+    mantlet.castShadow = true;
+    turret.add(mantlet);
+
+    // Commander cupola + raised hatch + periscope blocks
     const cupola = new THREE.Mesh(
       new THREE.CylinderGeometry(0.38 * scale, 0.42 * scale, 0.28 * scale, 10),
       steelMat
@@ -153,6 +263,21 @@ export class TankSystem {
     cupola.position.set(-0.3 * scale, 0.5 * scale, 0.2 * scale);
     turret.add(cupola);
 
+    const cupolaHatch = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.32 * scale, 0.34 * scale, 0.08 * scale, 10),
+      darkSteelMat
+    );
+    cupolaHatch.position.set(-0.3 * scale, 0.66 * scale, 0.2 * scale);
+    turret.add(cupolaHatch);
+
+    const periscope = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22 * scale, 0.11 * scale, 0.16 * scale),
+      darkSteelMat
+    );
+    periscope.position.set(-0.3 * scale, 0.72 * scale, 0.05 * scale);
+    turret.add(periscope);
+
+    // Main cannon barrel + muzzle brake (parented to barrel so it recoils together)
     const barrel = new THREE.Mesh(
       new THREE.CylinderGeometry(0.11 * scale, 0.14 * scale, 3.1 * scale, 10),
       steelMat
@@ -160,6 +285,15 @@ export class TankSystem {
     barrel.rotation.x = Math.PI * 0.5;
     barrel.position.set(0, 0.05 * scale, -2.1 * scale);
     barrel.castShadow = true;
+
+    const muzzleBrake = new THREE.Mesh(
+      new THREE.BoxGeometry(0.34 * scale, 0.38 * scale, 0.26 * scale),
+      darkSteelMat
+    );
+    // In barrel local space (rotated +PI/2 around X), -Y points toward the front muzzle
+    muzzleBrake.position.set(0, -1.56 * scale, 0);
+    barrel.add(muzzleBrake);
+
     turret.add(barrel);
 
     hull.add(turret);
@@ -285,6 +419,8 @@ export class TankSystem {
         const mat = (obj as THREE.Mesh).material as THREE.MeshStandardMaterial;
         if (mat && mat.color) {
           mat.color.setHex(0x211f1d);
+          mat.emissive?.setHex(0x000000);
+          mat.emissiveIntensity = 0;
         }
       }
     });

@@ -34,6 +34,8 @@ export interface UICallbacks {
   onTouchPause: () => void;
 }
 
+const GORE_ACK_STORAGE_KEY = 'tdn_gore_ack_v1';
+
 const COVER_LABELS: Record<HUDState['coverState'], string> = {
   dugout: 'ABRIGO SEGURO',
   sheltered: 'EM COBERTURA',
@@ -42,6 +44,8 @@ const COVER_LABELS: Record<HUDState['coverState'], string> = {
 };
 
 export class UIManager {
+  public onTouchSmoke: (() => void) | null = null;
+
   private root: HTMLElement;
   private callbacks: UICallbacks;
 
@@ -100,6 +104,8 @@ export class UIManager {
   private touchControlsEl!: HTMLElement;
   private touchBtnInteract!: HTMLElement;
   private touchBtnAds!: HTMLElement;
+  private touchBtnSmoke!: HTMLElement;
+  private goreWarningBannerEl!: HTMLElement;
   private orientationWarnEl!: HTMLElement;
   private dismissedPortraitWarning = false;
   private resetActiveTouchInputs: (() => void) | null = null;
@@ -337,8 +343,13 @@ export class UIManager {
     }
 
     // 7. Cover, Peek Danger & Vitals
-    this.coverPillEl.className = `cover-pill ${state.coverState}`;
-    this.coverTextEl.textContent = COVER_LABELS[state.coverState];
+    if (state.inSmokeScreen) {
+      this.coverPillEl.className = 'cover-pill smoke-hidden';
+      this.coverTextEl.textContent = 'OCULTO NA FUMAÇA';
+    } else {
+      this.coverPillEl.className = `cover-pill ${state.coverState}`;
+      this.coverTextEl.textContent = COVER_LABELS[state.coverState];
+    }
     this.postureTextEl.textContent = state.mgMounted
       ? 'METRALHADORA'
       : state.isCrouching
@@ -382,7 +393,7 @@ export class UIManager {
         this.ammoReadoutEl.innerHTML = `${state.ammoInMag} <span class="ammo-reserve">/ ${state.ammoReserve}</span>`;
       }
     }
-    this.extraAmmoEl.textContent = `GRANADAS [G]: ${state.grenades}  •  FOGUETES: ${state.rockets}`;
+    this.extraAmmoEl.textContent = `GRANADAS [G]: ${state.grenades}  •  FUMAÇA [X]: ${state.smokeGrenades}  •  FOGUETES: ${state.rockets}`;
 
     const slotOrder = ['rifle', 'smg', 'bazooka', 'grenade'];
     this.slotEls.forEach((el, idx) => {
@@ -393,14 +404,44 @@ export class UIManager {
     this.touchControlsEl.classList.toggle('hidden', !state.touchActive);
     this.touchBtnInteract.classList.toggle('highlight', Boolean(state.interactPrompt));
     this.touchBtnAds.classList.toggle('active', state.adsFactor > 0.4);
+    this.touchBtnSmoke.classList.toggle('empty', state.smokeGrenades <= 0);
 
     const showPortraitWarning =
       state.touchActive && window.innerHeight > window.innerWidth && !this.dismissedPortraitWarning;
     this.orientationWarnEl.classList.toggle('hidden', !showPortraitWarning);
   }
 
+  private isGoreAcknowledged(): boolean {
+    try {
+      return localStorage.getItem(GORE_ACK_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
   private buildDOM(): void {
+    const goreAcked = this.isGoreAcknowledged();
+
     this.root.innerHTML = `
+      <!-- EXPLICIT GORE / CONTENT WARNING BANNER (FIRST LAUNCH) -->
+      <div id="gore-warning-banner" class="gore-warning-overlay ${goreAcked ? 'hidden' : ''}" role="dialog" aria-modal="true" aria-labelledby="gore-warn-title">
+        <div class="gore-warning-card">
+          <div class="gore-warn-badge">CLASSIFICAÇÃO +18 • CONTEÚDO VISCERAL</div>
+          <h2 id="gore-warn-title">AVISO DE CONTEÚDO EXPLÍCITO</h2>
+          <p class="gore-warn-body">
+            <strong>TERRA DE NINGUÉM</strong> retrata a brutalidade realista dos combates em trincheiras.
+            Este jogo contém <strong>sangue explícito, desmembramento, ferimentos graves e violência visceral de guerra</strong>
+            (sem opção para desativar esses efeitos).
+          </p>
+          <p class="gore-warn-sub">
+            Recomendado apenas para jogadores maiores de 18 anos. Ao prosseguir, você confirma estar ciente do conteúdo apresentado.
+          </p>
+          <div class="gore-warn-actions">
+            <button id="btn-gore-ack" type="button" class="btn-primary">CIENTE — CONTINUAR</button>
+          </div>
+        </div>
+      </div>
+
       <!-- MAIN MENU / HQ -->
       <div id="screen-menu" class="screen-overlay">
         <div class="hq-layout">
@@ -510,8 +551,8 @@ export class UIManager {
             <div class="control-pair"><span>Espiar Esq / Dir</span><span><kbd>Q</kbd> <kbd>E</kbd></span></div>
             <div class="control-pair"><span>Atirar / Mirar</span><span><kbd>LMB</kbd> <kbd>RMB</kbd></span></div>
             <div class="control-pair"><span>Armas / Recarregar</span><span><kbd>1-4</kbd> <kbd>R</kbd></span></div>
-            <div class="control-pair"><span>Granada / Curativo</span><span><kbd>G</kbd> <kbd>H</kbd></span></div>
-            <div class="control-pair"><span>Interagir / Chutar Granada</span><span><kbd>F</kbd></span></div>
+            <div class="control-pair"><span>Frag / Fumaça</span><span><kbd>G</kbd> <kbd>X</kbd></span></div>
+            <div class="control-pair"><span>Curativo / Interagir</span><span><kbd>H</kbd> <kbd>F</kbd></span></div>
             <div class="control-pair"><span>Pausar</span><span><kbd>ESC</kbd></span></div>
           </div>
           <div class="cta-row" style="justify-content:space-between">
@@ -559,7 +600,7 @@ export class UIManager {
 
         <div id="controls-toast" class="controls-toast">
           [WASD] Mover • [C] Agachar • [Q/E] Espiar • [Espaço] Escalar<br />
-          [1] Fuzil • [2] SMG • [3] Bazuca • [G] Granada • [H] Curativo • [F] Interagir
+          [1-4] Armas • [G] Frag • [X] Fumaça • [H] Curativo • [F] Interagir
         </div>
 
         <div class="hud-top">
@@ -625,7 +666,7 @@ export class UIManager {
             <div id="hud-weapon-name" class="weapon-name">Fuzil M-42</div>
             <div id="hud-ammo-readout" class="ammo-readout">8 <span class="ammo-reserve">/ 56</span></div>
             <div id="hud-extra-ammo" style="font-family:var(--font-mono);font-size:0.72rem;color:var(--text-secondary);margin-top:4px">
-              GRANADAS [G]: 3 • FOGUETES: 5
+              GRANADAS [G]: 3 • FUMAÇA [X]: 2 • FOGUETES: 5
             </div>
           </div>
           <div class="weapon-slots">
@@ -658,8 +699,9 @@ export class UIManager {
           <div class="touch-cluster-right">
             <button id="touch-btn-ads" type="button" class="touch-btn">MIRAR</button>
             <button id="touch-btn-reload" type="button" class="touch-btn">RECARREGAR</button>
-            <button id="touch-btn-grenade" type="button" class="touch-btn">GRANADA</button>
             <button id="touch-btn-weapon" type="button" class="touch-btn">ARMA</button>
+            <button id="touch-btn-grenade" type="button" class="touch-btn">GRANADA</button>
+            <button id="touch-btn-smoke" type="button" class="touch-btn">FUMAÇA</button>
             <button id="touch-btn-fire" type="button" class="touch-btn fire">ATIRAR</button>
           </div>
         </div>
@@ -723,6 +765,8 @@ export class UIManager {
     this.touchControlsEl = this.root.querySelector('#touch-controls')!;
     this.touchBtnInteract = this.root.querySelector('#touch-btn-interact')!;
     this.touchBtnAds = this.root.querySelector('#touch-btn-ads')!;
+    this.touchBtnSmoke = this.root.querySelector('#touch-btn-smoke')!;
+    this.goreWarningBannerEl = this.root.querySelector('#gore-warning-banner')!;
     this.orientationWarnEl = this.root.querySelector('#orientation-warning')!;
 
     this.diffBtns = Array.from(this.root.querySelectorAll('.diff-btn')) as HTMLButtonElement[];
@@ -798,6 +842,14 @@ export class UIManager {
   }
 
   private bindButtonEvents(): void {
+    this.root.querySelector('#btn-gore-ack')!.addEventListener('click', () => {
+      try {
+        localStorage.setItem(GORE_ACK_STORAGE_KEY, '1');
+      } catch {
+        // ignore storage error
+      }
+      this.goreWarningBannerEl.classList.add('hidden');
+    });
     this.root.querySelector('#btn-start-campaign')!.addEventListener('click', () => {
       this.callbacks.onStartMissionBriefing();
     });
@@ -1027,6 +1079,7 @@ export class UIManager {
 
     bindTapButton('#touch-btn-reload', () => this.callbacks.onTouchKeyPress('KeyR'));
     bindHoldButton('#touch-btn-grenade', 'KeyG');
+    bindTapButton('#touch-btn-smoke', () => this.onTouchSmoke?.());
     bindTapButton('#touch-btn-weapon', () => this.callbacks.onTouchCycleWeapon());
 
     pauseBtn.addEventListener('pointerdown', (e) => {

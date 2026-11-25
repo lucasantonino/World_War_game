@@ -31,6 +31,8 @@ export interface GrenadeProjectile {
   maxFuse: number;
   faction: 'ally' | 'enemy';
   bounces: number;
+  isSmoke?: boolean;
+  trailTimer?: number;
 }
 
 export interface FallingBomb {
@@ -58,6 +60,7 @@ export interface ImpactCallbacks {
     cause: string,
     isFromPlayer: boolean
   ) => void;
+  onSmokeDetonate?: (pos: THREE.Vector3) => void;
 }
 
 export class ProjectileSystem {
@@ -77,8 +80,17 @@ export class ProjectileSystem {
   private enemyTracerMat = new THREE.MeshBasicMaterial({ color: 0xff6238 });
   private grenadeGeo = new THREE.SphereGeometry(0.085, 8, 8);
   private grenadeMat = new THREE.MeshStandardMaterial({ color: 0x4b5739, roughness: 0.75 });
+  private smokeGrenadeGeo = new THREE.CylinderGeometry(0.055, 0.055, 0.22, 8);
+  private smokeGrenadeMat = new THREE.MeshStandardMaterial({
+    color: 0x4b6344,
+    metalness: 0.45,
+    roughness: 0.45
+  });
+  private smokeBandGeo = new THREE.CylinderGeometry(0.058, 0.058, 0.055, 8);
+  private smokeBandMat = new THREE.MeshStandardMaterial({ color: 0xebeae4, roughness: 0.5 });
   private bombGeo = new THREE.CylinderGeometry(0.18, 0.24, 1.15, 8);
   private bombMat = new THREE.MeshStandardMaterial({ color: 0x262825, roughness: 0.6 });
+  private tmpTrailVel = new THREE.Vector3(0, 0.35, 0);
 
   constructor(
     scene: THREE.Scene,
@@ -182,6 +194,27 @@ export class ProjectileSystem {
     });
   }
 
+  public spawnSmokeGrenade(origin: THREE.Vector3, vel: THREE.Vector3, fuse = 1.35): void {
+    const mesh = new THREE.Mesh(this.smokeGrenadeGeo, this.smokeGrenadeMat);
+    const band = new THREE.Mesh(this.smokeBandGeo, this.smokeBandMat);
+    mesh.add(band);
+    mesh.position.copy(origin);
+    mesh.castShadow = true;
+    this.scene.add(mesh);
+
+    this.grenades.push({
+      mesh,
+      pos: origin.clone(),
+      vel: vel.clone(),
+      fuse,
+      maxFuse: fuse,
+      faction: 'ally',
+      bounces: 0,
+      isSmoke: true,
+      trailTimer: 0
+    });
+  }
+
   public spawnFallingBomb(x: number, y: number, z: number, heavy: boolean): void {
     const mesh = new THREE.Mesh(this.bombGeo, this.bombMat);
     mesh.position.set(x, y, z);
@@ -205,6 +238,7 @@ export class ProjectileSystem {
     let best: GrenadeProjectile | null = null;
     let bestDist = 7.5;
     for (const g of this.grenades) {
+      if (g.isSmoke) continue;
       const d = g.pos.distanceTo(playerPos);
       if (d < bestDist) {
         bestDist = d;
@@ -358,6 +392,8 @@ export class ProjectileSystem {
           'Explosão de foguete antitanque',
           r.faction === 'ally'
         );
+        this.cover.addSmokeCloud(expPos.x, expPos.y, expPos.z, 3.5, 5.5);
+        this.vfx.spawnPersistentSmokeScreen(expPos, 3.5, 5.5);
         this.scene.remove(r.mesh);
         this.rockets.splice(i, 1);
         continue;
@@ -398,16 +434,34 @@ export class ProjectileSystem {
       g.mesh.rotation.x += dt * 7;
       g.mesh.rotation.z += dt * 5;
 
+      if (g.isSmoke) {
+        g.trailTimer = (g.trailTimer ?? 0) + dt;
+        if (g.trailTimer >= 0.045) {
+          g.trailTimer = 0;
+          this.vfx.spawnSprite(g.pos, this.tmpTrailVel, 0xe8ede6, 0.14, 0.48, 0.42, 0.48, 0);
+        }
+      }
+
       if (g.fuse <= 0) {
-        callbacks.onExplosion(
-          g.pos,
-          6.8,
-          120,
-          2.1,
-          0.7,
-          g.faction === 'enemy' ? 'Granada inimiga dentro da trincheira' : 'Sua própria granada explodiu perto demais',
-          g.faction === 'ally'
-        );
+        if (g.isSmoke) {
+          this.cover.addSmokeCloud(g.pos.x, g.pos.y, g.pos.z, 6.4, 15.0);
+          this.vfx.spawnPersistentSmokeScreen(g.pos, 6.4, 15.0);
+          callbacks.onSmokeDetonate?.(g.pos);
+          const pan = Math.max(-1, Math.min(1, (g.pos.x - playerPos.x) / 20));
+          this.audio.playExplosion(Math.max(10, g.pos.distanceTo(playerPos) + 8), 0.24, pan);
+        } else {
+          callbacks.onExplosion(
+            g.pos,
+            6.8,
+            120,
+            2.1,
+            0.7,
+            g.faction === 'enemy' ? 'Granada inimiga dentro da trincheira' : 'Sua própria granada explodiu perto demais',
+            g.faction === 'ally'
+          );
+          this.cover.addSmokeCloud(g.pos.x, g.pos.y, g.pos.z, 3.6, 5.5);
+          this.vfx.spawnPersistentSmokeScreen(g.pos, 3.6, 5.5);
+        }
         this.scene.remove(g.mesh);
         this.grenades.splice(i, 1);
       }
@@ -432,6 +486,13 @@ export class ProjectileSystem {
           'Explosão de bomba aérea fora do abrigo',
           false
         );
+        if (b.radius >= 7.0) {
+          this.cover.addSmokeCloud(b.pos.x, b.pos.y, b.pos.z, 5.5, 9.0);
+          this.vfx.spawnPersistentSmokeScreen(b.pos, 5.5, 9.0);
+        } else if (b.radius >= 2.8) {
+          this.cover.addSmokeCloud(b.pos.x, b.pos.y, b.pos.z, 3.5, 5.5);
+          this.vfx.spawnPersistentSmokeScreen(b.pos, 3.5, 5.5);
+        }
         this.scene.remove(b.mesh);
         this.bombs.splice(i, 1);
       }

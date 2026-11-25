@@ -34,6 +34,18 @@ export interface PlayerCheckpointSnapshot {
   weaponId: WeaponId;
   magAmmo: Record<WeaponId, number>;
   reserveAmmo: Record<WeaponId, number>;
+  smokeGrenades?: number;
+}
+
+export interface SmokeCloud {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  maxRadius: number;
+  age: number;
+  duration: number;
 }
 
 export interface TrenchSegment {
@@ -307,6 +319,8 @@ export interface HUDState {
   livingEnemies: number;
   remainingWaveEnemies: number;
   touchActive: boolean;
+  smokeGrenades: number;
+  inSmokeScreen: boolean;
 }
 
 export interface GameSettings {

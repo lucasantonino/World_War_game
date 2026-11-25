@@ -27,6 +27,12 @@ interface Particle {
   gravity: number;
   startOpacity: number;
   groundY?: number;
+  isSmokePuff?: boolean;
+  isPuddle?: boolean;
+  sharedMaterial?: boolean;
+  rotSpeed?: number;
+  growTime?: number;
+  drag?: number;
 }
 
 interface FlashLightSlot {
@@ -41,11 +47,30 @@ export class VFXSystem {
   private particles: Particle[] = [];
   private lights: FlashLightSlot[] = [];
   private glowTex: THREE.Texture;
+  private smokeTex: THREE.Texture;
   private debrisGeo = new THREE.BoxGeometry(0.14, 0.12, 0.18);
+  private headGeo = new THREE.SphereGeometry(0.13, 7, 6);
+  private legGeo = new THREE.CylinderGeometry(0.06, 0.052, 0.42, 6);
+  private torsoGeo = new THREE.BoxGeometry(0.24, 0.28, 0.16);
+  private goreChunkGeo = new THREE.DodecahedronGeometry(0.1, 0);
+  private puddleGeo = new THREE.CircleGeometry(0.32, 10);
+  private goreMat = new THREE.MeshStandardMaterial({ color: 0x6b0b0b, roughness: 0.55 });
+  private uniformGoreMat = new THREE.MeshStandardMaterial({ color: 0x454b3d, roughness: 0.85 });
+  private helmetGoreMat = new THREE.MeshStandardMaterial({
+    color: 0x3a4035,
+    roughness: 0.72,
+    metalness: 0.15
+  });
+  private groundHeightFn: ((x: number, z: number) => number) | null = null;
+  private tmpPos = new THREE.Vector3();
+  private tmpVel = new THREE.Vector3();
+  private tmpDir = new THREE.Vector3();
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
     this.glowTex = getProceduralTextures().radialGlow;
+    this.smokeTex = this.buildNeutralSmokeTexture();
+    this.puddleGeo.rotateX(-Math.PI * 0.5);
 
     // Pre-allocate 4 dynamic flash PointLights to stay safely within WebGL uniform budgets
     for (let i = 0; i < 4; i++) {
@@ -55,10 +80,38 @@ export class VFXSystem {
     }
   }
 
+  public setGroundHeightResolver(fn: (x: number, z: number) => number): void {
+    this.groundHeightFn = fn;
+  }
+
+  private buildNeutralSmokeTexture(): THREE.Texture {
+    if (typeof document === 'undefined') return this.glowTex;
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return this.glowTex;
+
+    const grad = ctx.createRadialGradient(64, 64, 6, 64, 64, 60);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 0.96)');
+    grad.addColorStop(0.42, 'rgba(242, 245, 242, 0.72)');
+    grad.addColorStop(0.76, 'rgba(220, 225, 220, 0.28)');
+    grad.addColorStop(1, 'rgba(200, 205, 200, 0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 128, 128);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
   public clear(): void {
     for (const p of this.particles) {
       this.scene.remove(p.mesh);
-      (p.mesh.material as THREE.Material).dispose();
+      if (!p.sharedMaterial) {
+        (p.mesh.material as THREE.Material).dispose();
+      }
     }
     this.particles = [];
     for (const l of this.lights) {
@@ -91,9 +144,18 @@ export class VFXSystem {
 
   private enforceParticlePoolLimit(): void {
     while (this.particles.length >= MAX_PARTICLES) {
-      const oldest = this.particles.shift()!;
-      this.scene.remove(oldest.mesh);
-      (oldest.mesh.material as THREE.Material).dispose();
+      let evictIdx = 0;
+      for (let i = 0; i < this.particles.length; i++) {
+        if (!this.particles[i].isSmokePuff) {
+          evictIdx = i;
+          break;
+        }
+      }
+      const evicted = this.particles.splice(evictIdx, 1)[0];
+      this.scene.remove(evicted.mesh);
+      if (!evicted.sharedMaterial) {
+        (evicted.mesh.material as THREE.Material).dispose();
+      }
     }
   }
 
@@ -392,34 +454,380 @@ export class VFXSystem {
     );
   }
 
+  private spawnBloodPuddle(
+    x: number,
+    fallbackY: number,
+    z: number,
+    startScale: number,
+    endScale: number,
+    maxAge: number
+  ): void {
+    this.enforceParticlePoolLimit();
+    const gy = this.groundHeightFn ? this.groundHeightFn(x, z) + 0.035 : fallbackY;
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x4f0606,
+      transparent: true,
+      opacity: 0.78,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1
+    });
+    const mesh = new THREE.Mesh(this.puddleGeo, mat);
+    mesh.position.set(x, gy, z);
+    mesh.rotation.y = Math.random() * Math.PI * 2;
+    mesh.scale.set(startScale, 1, startScale);
+    this.scene.add(mesh);
+
+    this.particles.push({
+      mesh,
+      isMesh: true,
+      isPuddle: true,
+      vel: new THREE.Vector3(0, 0, 0),
+      age: 0,
+      maxAge,
+      startScale,
+      endScale,
+      gravity: 0,
+      startOpacity: 0.78
+    });
+  }
+
+  private spawnGoreFragment(
+    pos: THREE.Vector3,
+    vel: THREE.Vector3,
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    maxAge: number,
+    groundY: number
+  ): void {
+    this.enforceParticlePoolLimit();
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(pos);
+    mesh.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+    this.scene.add(mesh);
+
+    this.particles.push({
+      mesh,
+      isMesh: true,
+      sharedMaterial: true,
+      vel: vel.clone(),
+      age: 0,
+      maxAge,
+      startScale: 1,
+      endScale: 0.92,
+      gravity: 17.8,
+      startOpacity: 1,
+      groundY
+    });
+  }
+
+  public spawnBloodSplatter(pos: THREE.Vector3, dir?: THREE.Vector3, intensity = 1.0): void {
+    const power = Math.max(0.4, Math.min(2.2, intensity));
+    const dropCount = Math.min(9, Math.max(3, Math.round(5 * power)));
+    const hasDir = Boolean(dir && dir.lengthSq() > 1e-4);
+    if (hasDir && dir) {
+      this.tmpDir.copy(dir).normalize();
+    }
+
+    for (let i = 0; i < dropCount; i++) {
+      this.enforceParticlePoolLimit();
+      if (hasDir) {
+        const forwardSpd = (1.8 + Math.random() * 3.4) * power;
+        this.tmpVel.set(
+          this.tmpDir.x * forwardSpd + (Math.random() - 0.5) * 2.4 * power,
+          0.9 + Math.random() * 2.6 * power,
+          this.tmpDir.z * forwardSpd + (Math.random() - 0.5) * 2.4 * power
+        );
+      } else {
+        const ang = Math.random() * Math.PI * 2;
+        const spd = (1.1 + Math.random() * 2.6) * power;
+        this.tmpVel.set(Math.cos(ang) * spd, 1.4 + Math.random() * 2.8 * power, Math.sin(ang) * spd);
+      }
+
+      const mat = new THREE.SpriteMaterial({
+        map: this.smokeTex,
+        color: i % 3 === 0 ? 0x540505 : i % 2 === 0 ? 0x7c0b0b : 0x941313,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.set(
+        pos.x + (Math.random() - 0.5) * 0.14,
+        pos.y + (Math.random() - 0.5) * 0.14,
+        pos.z + (Math.random() - 0.5) * 0.14
+      );
+      const s0 = (0.18 + Math.random() * 0.12) * Math.min(1.4, power);
+      sprite.scale.set(s0, s0, 1);
+      this.scene.add(sprite);
+
+      this.particles.push({
+        mesh: sprite,
+        isMesh: false,
+        vel: this.tmpVel.clone(),
+        age: 0,
+        maxAge: 0.34 + Math.random() * 0.28,
+        startScale: s0,
+        endScale: s0 * 0.45,
+        gravity: 15.5,
+        startOpacity: 0.9
+      });
+    }
+
+    const px = pos.x + (hasDir ? this.tmpDir.x * 0.35 : 0) + (Math.random() - 0.5) * 0.25;
+    const pz = pos.z + (hasDir ? this.tmpDir.z * 0.35 : 0) + (Math.random() - 0.5) * 0.25;
+    this.spawnBloodPuddle(
+      px,
+      pos.y - 0.82,
+      pz,
+      0.38 * Math.min(1.5, power),
+      1.05 * Math.min(1.5, power),
+      4.2 + Math.random() * 1.8
+    );
+  }
+
+  public spawnDismemberment(
+    pos: THREE.Vector3,
+    type: 'head' | 'leg' | 'torso',
+    blastDir?: THREE.Vector3
+  ): void {
+    const hasDir = Boolean(blastDir && blastDir.lengthSq() > 1e-4);
+    if (hasDir && blastDir) {
+      this.tmpDir.copy(blastDir).normalize();
+    }
+    const groundY = this.groundHeightFn ? this.groundHeightFn(pos.x, pos.z) + 0.08 : pos.y - 0.35;
+
+    const specs: Array<{ geo: THREE.BufferGeometry; mat: THREE.Material }> =
+      type === 'head'
+        ? [
+            { geo: this.headGeo, mat: this.helmetGoreMat },
+            { geo: this.goreChunkGeo, mat: this.goreMat }
+          ]
+        : type === 'leg'
+          ? [
+              { geo: this.legGeo, mat: this.uniformGoreMat },
+              { geo: this.goreChunkGeo, mat: this.goreMat }
+            ]
+          : [
+              { geo: this.torsoGeo, mat: this.uniformGoreMat },
+              { geo: this.legGeo, mat: this.uniformGoreMat },
+              { geo: this.goreChunkGeo, mat: this.goreMat }
+            ];
+
+    for (let i = 0; i < specs.length; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const lateral = 2.2 + Math.random() * 3.8;
+      this.tmpVel.set(
+        Math.cos(ang) * lateral + (hasDir ? this.tmpDir.x * 3.8 : 0),
+        4.6 + Math.random() * 4.2,
+        Math.sin(ang) * lateral + (hasDir ? this.tmpDir.z * 3.8 : 0)
+      );
+      this.tmpPos.set(
+        pos.x + (Math.random() - 0.5) * 0.22,
+        pos.y + 0.25 + Math.random() * 0.35,
+        pos.z + (Math.random() - 0.5) * 0.22
+      );
+      this.spawnGoreFragment(
+        this.tmpPos,
+        this.tmpVel,
+        specs[i].geo,
+        specs[i].mat,
+        3.2 + Math.random() * 1.4,
+        groundY
+      );
+    }
+
+    this.spawnBloodSplatter(pos, blastDir, 1.5);
+  }
+
+  public spawnGoreExplosion(pos: THREE.Vector3): void {
+    // Dense crimson mist
+    for (let i = 0; i < 5; i++) {
+      this.enforceParticlePoolLimit();
+      const ang = (i / 5) * Math.PI * 2 + Math.random() * 0.5;
+      const spd = 1.2 + Math.random() * 2.4;
+      this.tmpVel.set(Math.cos(ang) * spd, 1.1 + Math.random() * 1.8, Math.sin(ang) * spd);
+      const mat = new THREE.SpriteMaterial({
+        map: this.smokeTex,
+        color: i % 2 === 0 ? 0x6b0808 : 0x450404,
+        transparent: true,
+        opacity: 0.82,
+        depthWrite: false
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.set(
+        pos.x + (Math.random() - 0.5) * 0.5,
+        pos.y + 0.45 + Math.random() * 0.45,
+        pos.z + (Math.random() - 0.5) * 0.5
+      );
+      sprite.scale.set(0.75, 0.75, 1);
+      this.scene.add(sprite);
+
+      this.particles.push({
+        mesh: sprite,
+        isMesh: false,
+        vel: this.tmpVel.clone(),
+        age: 0,
+        maxAge: 0.75 + Math.random() * 0.35,
+        startScale: 0.75,
+        endScale: 2.35,
+        gravity: 1.8,
+        startOpacity: 0.82,
+        growTime: 0.45,
+        drag: 2.2
+      });
+    }
+
+    // Multiple anatomical/gore fragments
+    const groundY = this.groundHeightFn ? this.groundHeightFn(pos.x, pos.z) + 0.08 : pos.y + 0.04;
+    const fragGeos = [this.torsoGeo, this.legGeo, this.goreChunkGeo, this.goreChunkGeo];
+    const fragMats = [this.uniformGoreMat, this.uniformGoreMat, this.goreMat, this.goreMat];
+    for (let i = 0; i < fragGeos.length; i++) {
+      const ang = (i / fragGeos.length) * Math.PI * 2 + Math.random() * 0.7;
+      const spd = 3.2 + Math.random() * 4.6;
+      this.tmpVel.set(Math.cos(ang) * spd, 5.2 + Math.random() * 4.8, Math.sin(ang) * spd);
+      this.tmpPos.set(pos.x, pos.y + 0.35, pos.z);
+      this.spawnGoreFragment(
+        this.tmpPos,
+        this.tmpVel,
+        fragGeos[i],
+        fragMats[i],
+        3.5 + Math.random() * 1.4,
+        groundY
+      );
+    }
+
+    // Larger blood pool on ground
+    this.spawnBloodPuddle(pos.x, pos.y + 0.035, pos.z, 0.75, 1.85, 5.4);
+  }
+
+  public spawnPersistentSmokeScreen(
+    pos: THREE.Vector3,
+    radius = 6.2,
+    duration = 14.0
+  ): void {
+    const puffCount = radius >= 5.5 ? 16 : radius >= 4.2 ? 10 : 7;
+    const palette = [0xc2cbc2, 0xaeb9ae, 0xd4dad2, 0x9aa69b];
+
+    for (let i = 0; i < puffCount; i++) {
+      this.enforceParticlePoolLimit();
+      const ringFactor = i < 4 ? 0.18 + Math.random() * 0.25 : 0.35 + Math.random() * 0.55;
+      const ang = (i / puffCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.55;
+      const dist = radius * ringFactor * 0.72;
+      const px = pos.x + Math.cos(ang) * dist;
+      const pz = pos.z + Math.sin(ang) * dist;
+      const py = pos.y + 0.65 + Math.random() * Math.min(2.6, radius * 0.42);
+
+      const outSpd = 0.7 + Math.random() * 1.4;
+      this.tmpVel.set(
+        Math.cos(ang) * outSpd + (Math.random() - 0.5) * 0.35,
+        0.35 + Math.random() * 0.55,
+        Math.sin(ang) * outSpd + (Math.random() - 0.5) * 0.35
+      );
+
+      const startScale = radius * (0.42 + Math.random() * 0.16);
+      const endScale = radius * (0.95 + Math.random() * 0.38);
+      const baseLife = Math.min(duration, 10.5 + Math.random() * 3.5);
+      const life = duration < 10.5 ? duration * (0.85 + Math.random() * 0.15) : baseLife;
+      const opacity = 0.56 + Math.random() * 0.16;
+
+      const mat = new THREE.SpriteMaterial({
+        map: this.smokeTex,
+        color: palette[i % palette.length],
+        transparent: true,
+        opacity: 0.05,
+        depthWrite: false,
+        rotation: Math.random() * Math.PI * 2
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.set(px, py, pz);
+      sprite.scale.set(startScale, startScale, 1);
+      this.scene.add(sprite);
+
+      this.particles.push({
+        mesh: sprite,
+        isMesh: false,
+        isSmokePuff: true,
+        vel: this.tmpVel.clone(),
+        age: 0,
+        maxAge: life,
+        startScale,
+        endScale,
+        gravity: -0.05,
+        startOpacity: opacity,
+        rotSpeed: (Math.random() - 0.5) * 0.24,
+        growTime: 1.25 + Math.random() * 0.45,
+        drag: 1.45
+      });
+    }
+  }
+
   public update(dt: number): void {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
       p.age += dt;
       if (p.age >= p.maxAge) {
         this.scene.remove(p.mesh);
-        (p.mesh.material as THREE.Material).dispose();
+        if (!p.sharedMaterial) {
+          (p.mesh.material as THREE.Material).dispose();
+        }
         this.particles.splice(i, 1);
         continue;
       }
 
       const t = p.age / p.maxAge;
+      if (p.isPuddle) {
+        const spreadT = Math.min(1, p.age / 0.65);
+        const eased = spreadT * (2 - spreadT);
+        const s = THREE.MathUtils.lerp(p.startScale, p.endScale, eased);
+        p.mesh.scale.set(s, 1, s);
+        const mat = p.mesh.material as THREE.MeshBasicMaterial;
+        mat.opacity = t > 0.7 ? p.startOpacity * (1 - (t - 0.7) / 0.3) : p.startOpacity;
+        continue;
+      }
+
+      if (p.drag) {
+        const damp = Math.max(0, 1 - p.drag * dt);
+        p.vel.x *= damp;
+        p.vel.z *= damp;
+      }
       p.vel.y -= p.gravity * dt;
       p.mesh.position.addScaledVector(p.vel, dt);
 
-      if (p.isMesh && p.groundY !== undefined && p.mesh.position.y < p.groundY && p.vel.y < 0) {
-        p.mesh.position.y = p.groundY;
-        p.vel.y = -p.vel.y * 0.35;
-        p.vel.x *= 0.65;
-        p.vel.z *= 0.65;
-      }
-
-      const s = THREE.MathUtils.lerp(p.startScale, p.endScale, t);
       if (p.isMesh) {
+        const gy =
+          this.groundHeightFn !== null
+            ? this.groundHeightFn(p.mesh.position.x, p.mesh.position.z) + 0.08
+            : p.groundY;
+        if (gy !== undefined && p.mesh.position.y < gy && p.vel.y < 0) {
+          p.mesh.position.y = gy;
+          p.vel.y = -p.vel.y * 0.35;
+          p.vel.x *= 0.65;
+          p.vel.z *= 0.65;
+        }
+        const s = THREE.MathUtils.lerp(p.startScale, p.endScale, t);
         p.mesh.scale.setScalar(s);
-        p.mesh.rotation.x += dt * 7;
-        p.mesh.rotation.y += dt * 5;
+        if (gy === undefined || p.mesh.position.y > gy + 0.04 || Math.abs(p.vel.y) > 0.25) {
+          p.mesh.rotation.x += dt * 7;
+          p.mesh.rotation.y += dt * 5;
+        }
+      } else if (p.isSmokePuff) {
+        const growDur = p.growTime ?? 1.35;
+        const growT = Math.min(1, p.age / growDur);
+        const easedGrow = growT * (2 - growT);
+        const baseScale = THREE.MathUtils.lerp(p.startScale, p.endScale, easedGrow);
+        const driftScale = baseScale * (1 + t * 0.12);
+        p.mesh.scale.set(driftScale, driftScale, 1);
+
+        const mat = p.mesh.material as THREE.SpriteMaterial;
+        mat.rotation += (p.rotSpeed ?? 0) * dt;
+        const fadeIn = Math.min(1, p.age / 0.38);
+        const remaining = p.maxAge - p.age;
+        const fadeOut = remaining < 2.4 ? Math.max(0, remaining / 2.4) : 1;
+        mat.opacity = p.startOpacity * fadeIn * fadeOut;
       } else {
+        const growT = p.growTime ? Math.min(1, p.age / p.growTime) : t;
+        const s = THREE.MathUtils.lerp(p.startScale, p.endScale, growT);
         p.mesh.scale.set(s, s, 1);
         const mat = p.mesh.material as THREE.SpriteMaterial;
         mat.opacity = p.startOpacity * (1 - t * t);

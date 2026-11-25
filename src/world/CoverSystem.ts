@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CoverState, DestructibleSpec, DestructionStage, RaycastHit } from '../types';
+import { CoverState, DestructibleSpec, DestructionStage, RaycastHit, SmokeCloud } from '../types';
 import { Terrain } from './Terrain';
 
 export interface SolidBoxCollider {
@@ -56,6 +56,8 @@ export class CoverSystem {
   >();
   private tankHulls: TankHullCollider[] = [];
   private wireHazards: WireHazard[] = [];
+  private smokeClouds: SmokeCloud[] = [];
+  private nextSmokeId = 1;
   private onStageChangedGlobal: ((spec: DestructibleSpec, stage: DestructionStage) => void) | null =
     null;
 
@@ -74,6 +76,99 @@ export class CoverSystem {
     this.destructibles.clear();
     this.tankHulls = [];
     this.wireHazards = [];
+    this.clearSmokeClouds();
+  }
+
+  public addSmokeCloud(x: number, y: number, z: number, maxRadius = 6.2, duration = 14.0): void {
+    const clampedMax = Math.max(0.5, maxRadius);
+    const clampedDur = Math.max(0.5, duration);
+    this.smokeClouds.push({
+      id: this.nextSmokeId++,
+      x,
+      y,
+      z,
+      radius: clampedMax * 0.4,
+      maxRadius: clampedMax,
+      age: 0,
+      duration: clampedDur
+    });
+  }
+
+  public updateSmokeClouds(dt: number): void {
+    for (let i = this.smokeClouds.length - 1; i >= 0; i--) {
+      const c = this.smokeClouds[i];
+      c.age += dt;
+      if (c.age >= c.duration) {
+        this.smokeClouds.splice(i, 1);
+        continue;
+      }
+
+      const growDuration = Math.min(1.2, c.duration * 0.25);
+      const growT = growDuration > 0 ? Math.min(1, c.age / growDuration) : 1;
+      const easedGrow = growT * (2 - growT);
+      let r = c.maxRadius * (0.4 + 0.6 * easedGrow);
+
+      // Slight dissipation near end of lifetime
+      const fadeDuration = Math.min(2.5, c.duration * 0.3);
+      const remaining = c.duration - c.age;
+      if (remaining < fadeDuration && fadeDuration > 0) {
+        const fadeOutT = 1 - remaining / fadeDuration;
+        r *= 1 - fadeOutT * 0.35;
+      }
+      c.radius = r;
+    }
+  }
+
+  public clearSmokeClouds(): void {
+    this.smokeClouds.length = 0;
+  }
+
+  public isPointInSmoke(x: number, y: number, z: number): boolean {
+    for (let i = 0; i < this.smokeClouds.length; i++) {
+      const c = this.smokeClouds[i];
+      if (Math.abs(y - c.y) > c.radius * 0.85) continue;
+      const dx = x - c.x;
+      const dy = y - c.y;
+      const dz = z - c.z;
+      const effR = c.radius * 0.92;
+      if (dx * dx + dy * dy + dz * dz <= effR * effR) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public isSegmentBlockedBySmoke(
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number
+  ): boolean {
+    if (this.smokeClouds.length === 0) return false;
+    const abx = bx - ax;
+    const aby = by - ay;
+    const abz = bz - az;
+    const lenSq = abx * abx + aby * aby + abz * abz;
+    // Ignore when both endpoints are virtually touching at point-blank minimum radius
+    if (lenSq < 0.04) return false;
+
+    for (let i = 0; i < this.smokeClouds.length; i++) {
+      const c = this.smokeClouds[i];
+      const effR = c.radius * 0.88;
+      const acx = c.x - ax;
+      const acy = c.y - ay;
+      const acz = c.z - az;
+      const t = Math.max(0, Math.min(1, (acx * abx + acy * aby + acz * abz) / lenSq));
+      const dx = ax + abx * t - c.x;
+      const dy = ay + aby * t - c.y;
+      const dz = az + abz * t - c.z;
+      if (dx * dx + dy * dy + dz * dz <= effR * effR) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public addStaticBox(box: SolidBoxCollider): void {
@@ -484,6 +579,9 @@ export class CoverSystem {
     const delta = new THREE.Vector3().subVectors(to, from);
     const dist = delta.length();
     if (dist < 0.1) return true;
+    if (this.isSegmentBlockedBySmoke(from.x, from.y, from.z, to.x, to.y, to.z)) {
+      return false;
+    }
     const dir = delta.divideScalar(dist);
     const hit = this.raycastWorld(from, dir, dist - 0.15, true);
     return hit === null;

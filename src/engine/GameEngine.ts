@@ -1,4 +1,9 @@
 import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { BomberSystem } from '../entities/BomberSystem';
 import { PlayerController, WEAPON_STATS } from '../entities/PlayerController';
 import { ProjectileSystem } from '../entities/ProjectileSystem';
@@ -27,10 +32,50 @@ import { InputManager } from './InputManager';
 const STORAGE_COMPLETED_KEY = 'tdn_completed_ops_v1';
 const STORAGE_SETTINGS_KEY = 'tdn_settings_v1';
 
+const WAR_GRADE_VIGNETTE_SHADER = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTint: { value: new THREE.Vector3(1.0, 1.0, 1.0) },
+    uSaturation: { value: 0.84 },
+    uContrast: { value: 1.06 },
+    uVignette: { value: 0.26 }
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform vec3 uTint;
+    uniform float uSaturation;
+    uniform float uContrast;
+    uniform float uVignette;
+    varying vec2 vUv;
+    void main() {
+      vec4 tex = texture2D(tDiffuse, vUv);
+      vec3 col = tex.rgb;
+      float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      col = mix(vec3(luma), col, uSaturation);
+      col = (col - 0.5) * uContrast + 0.5;
+      col *= uTint;
+      float dist = distance(vUv, vec2(0.5));
+      float vig = smoothstep(0.38, 0.92, dist);
+      col *= 1.0 - vig * uVignette;
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), tex.a);
+    }
+  `
+};
+
 export class GameEngine {
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
+  private composer: EffectComposer | null = null;
+  private bloomPass: UnrealBloomPass | null = null;
+  private gradePass: ShaderPass | null = null;
 
   private audio: AudioEngine;
   private input: InputManager;
@@ -89,6 +134,8 @@ export class GameEngine {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.08, 240);
     this.scene.add(this.camera);
+
+    this.initPostProcessing();
 
     this.audio = new AudioEngine();
     this.audio.setMasterVolume(this.settings.masterVolume);
@@ -225,18 +272,83 @@ export class GameEngine {
       }
     });
 
+    this.ui.onTouchSmoke = () => {
+      this.player.throwSmokeGrenade();
+    };
+
     this.input.setOnPauseRequested(() => {
       this.pauseGameplay();
     });
 
     window.addEventListener('resize', () => {
-      this.camera.aspect = window.innerWidth / window.innerHeight;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
-      this.renderer.setSize(window.innerWidth, window.innerHeight);
+      this.renderer.setSize(w, h);
+      if (this.composer) {
+        this.composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.composer.setSize(w, h);
+      }
+      if (this.bloomPass) {
+        this.bloomPass.resolution.set(w, h);
+      }
     });
 
     this.previewMenuScene(0);
     this.animate();
+  }
+
+  private initPostProcessing(): void {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.composer.setSize(w, h);
+
+    const renderPass = new RenderPass(this.scene, this.camera);
+    this.composer.addPass(renderPass);
+
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.26, 0.35, 0.82);
+    this.composer.addPass(this.bloomPass);
+
+    const outputPass = new OutputPass();
+    this.composer.addPass(outputPass);
+
+    this.gradePass = new ShaderPass(WAR_GRADE_VIGNETTE_SHADER);
+    this.composer.addPass(this.gradePass);
+
+    this.applyMissionColorGrade(0);
+  }
+
+  private shouldUsePostProcessing(): boolean {
+    return !this.isMobileDevice() && this.settings.quality !== 'low';
+  }
+
+  private applyMissionColorGrade(id: MissionId): void {
+    if (!this.gradePass) return;
+    const u = this.gradePass.uniforms;
+    if (id === 0) {
+      (u.uTint.value as THREE.Vector3).set(1.03, 0.99, 0.93);
+      u.uSaturation.value = 0.84;
+      u.uContrast.value = 1.06;
+      u.uVignette.value = 0.26;
+    } else if (id === 1) {
+      (u.uTint.value as THREE.Vector3).set(0.93, 0.98, 1.04);
+      u.uSaturation.value = 0.78;
+      u.uContrast.value = 1.08;
+      u.uVignette.value = 0.28;
+    } else if (id === 2) {
+      (u.uTint.value as THREE.Vector3).set(1.05, 0.95, 0.91);
+      u.uSaturation.value = 0.82;
+      u.uContrast.value = 1.09;
+      u.uVignette.value = 0.28;
+    } else {
+      (u.uTint.value as THREE.Vector3).set(0.9, 0.96, 1.06);
+      u.uSaturation.value = 0.8;
+      u.uContrast.value = 1.1;
+      u.uVignette.value = 0.32;
+    }
   }
 
   private pauseGameplay(): void {
@@ -261,6 +373,7 @@ export class GameEngine {
     this.clearCombatActors();
     this.terrain.loadMission(cfg);
     this.envBuilder.buildMission(cfg, this.settings.quality);
+    this.applyMissionColorGrade(id);
     this.player.viewModel.root.visible = false;
   }
 
@@ -280,6 +393,7 @@ export class GameEngine {
 
     this.terrain.loadMission(cfg);
     this.envBuilder.buildMission(cfg, this.settings.quality);
+    this.applyMissionColorGrade(id);
     this.liveInteractables = cfg.interactables.map((i) => ({ ...i }));
 
     this.player.resetForMission(cfg.playerSpawn.x, cfg.playerSpawn.z, cfg.playerSpawn.yaw);
@@ -327,6 +441,7 @@ export class GameEngine {
 
     this.terrain.loadMission(cfg);
     this.envBuilder.buildMission(cfg, this.settings.quality);
+    this.applyMissionColorGrade(this.selectedMissionId);
     this.liveInteractables = cfg.interactables.map((i) => ({ ...i }));
 
     let spawnX = cfg.playerSpawn.x;
@@ -709,6 +824,7 @@ export class GameEngine {
       diffConfig.bleedChanceMult
     );
 
+    this.cover.updateSmokeClouds(dt);
     this.vfx.update(dt);
     this.envBuilder.update(dt, this.totalElapsed);
     this.terrain.flushDirtyNormals();
@@ -825,6 +941,22 @@ export class GameEngine {
     }
 
     const gWarn = this.projectiles.getNearestDangerGrenade(this.player.pos, this.player.yaw);
+    const inSmokeScreen = this.cover.isPointInSmoke(
+      this.player.pos.x,
+      this.player.pos.y + 1.0,
+      this.player.pos.z
+    );
+    const touchActive = this.input.isTouchActive();
+    const smokeHintPrompt =
+      !playerInteraction.interactPrompt &&
+      !touchActive &&
+      !inSmokeScreen &&
+      this.player.smokeGrenades > 0 &&
+      this.missionElapsed < 35 &&
+      (this.player.coverState === 'exposed' || this.player.peekDanger > 0.65)
+        ? '[X] Lançar Granada de Fumaça'
+        : null;
+
     const stats = WEAPON_STATS[this.player.weaponId];
     const spreadPx =
       (THREE.MathUtils.lerp(stats.spreadHip, stats.spreadAds, this.player.adsFactor) +
@@ -857,7 +989,7 @@ export class GameEngine {
       mgMounted: this.player.mgMounted,
       mgHeat: this.player.mgHeat,
       mgOverheated: this.player.mgOverheated,
-      interactPrompt: playerInteraction.interactPrompt,
+      interactPrompt: playerInteraction.interactPrompt ?? smokeHintPrompt,
       actionProgress: playerInteraction.actionProgress,
       actionLabel: playerInteraction.actionLabel,
       grenadeWarning: gWarn
@@ -877,7 +1009,7 @@ export class GameEngine {
       hitMarkerTimer: this.player.hitMarkerTimer,
       hitMarkerCrit: this.player.hitMarkerCrit,
       spreadPx,
-      showControlsHint: this.missionElapsed < 18 && this.selectedMissionId === 0,
+      showControlsHint: this.missionElapsed < 20 && (this.selectedMissionId === 0 || this.selectedMissionId === 3),
       peekDanger: this.player.peekDanger,
       isRegenerating: this.player.isRegenerating,
       difficulty: this.settings.difficulty,
@@ -886,7 +1018,9 @@ export class GameEngine {
       checkpointToast: this.checkpointToast,
       livingEnemies: this.soldiers.getLivingEnemyCount(),
       remainingWaveEnemies: this.soldiers.getRemainingWaveCount(),
-      touchActive: this.input.isTouchActive()
+      touchActive,
+      smokeGrenades: this.player.smokeGrenades,
+      inSmokeScreen
     };
 
     this.ui.updateHUD(hud);
@@ -910,7 +1044,11 @@ export class GameEngine {
       }
     }
 
-    this.renderer.render(this.scene, this.camera);
+    if (this.composer && this.shouldUsePostProcessing()) {
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
   };
 
   private loadCompleted(): Set<MissionId> {

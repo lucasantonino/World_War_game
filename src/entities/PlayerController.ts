@@ -122,6 +122,7 @@ export class PlayerController {
 
   public cookingGrenade = false;
   public cookTimer = 0;
+  public smokeGrenades = 2;
 
   public lastDamageCause = 'Fogo cruzado inimigo';
   public damageIndicators: DamageIndicator[] = [];
@@ -201,6 +202,7 @@ export class PlayerController {
     this.mgOverheated = false;
     this.cookingGrenade = false;
     this.cookTimer = 0;
+    this.smokeGrenades = 2;
 
     this.damageIndicators = [];
     this.shotsFired = 0;
@@ -218,7 +220,8 @@ export class PlayerController {
       bandages: this.bandages,
       weaponId: this.weaponId,
       magAmmo: { ...this.magAmmo },
-      reserveAmmo: { ...this.reserveAmmo }
+      reserveAmmo: { ...this.reserveAmmo },
+      smokeGrenades: this.smokeGrenades
     };
   }
 
@@ -228,6 +231,7 @@ export class PlayerController {
     this.bandages = Math.max(2, snap.bandages);
     this.magAmmo = { ...snap.magAmmo };
     this.reserveAmmo = { ...snap.reserveAmmo };
+    this.smokeGrenades = snap.smokeGrenades ?? 2;
     this.weaponId = snap.weaponId === 'grenade' && this.reserveAmmo.grenade <= 0 ? 'rifle' : snap.weaponId;
     this.viewModel.setWeapon(this.weaponId);
   }
@@ -291,6 +295,7 @@ export class PlayerController {
     this.reserveAmmo.smg = 180;
     this.reserveAmmo.bazooka = Math.max(this.reserveAmmo.bazooka, 6);
     this.reserveAmmo.grenade = Math.max(this.reserveAmmo.grenade, 4);
+    if (this.smokeGrenades < 3) this.smokeGrenades = 3;
     this.audio.playReload();
   }
 
@@ -558,6 +563,10 @@ export class PlayerController {
       else if (this.input.consumeKeyPress('Digit3')) this.switchWeapon('bazooka');
       else if (this.input.consumeKeyPress('Digit4')) this.switchWeapon('grenade');
 
+      if (this.input.consumeKeyPress('KeyX') || this.input.consumeKeyPress('Digit5')) {
+        this.throwSmokeGrenade();
+      }
+
       if (this.input.consumeKeyPress('KeyR')) {
         this.startReload();
       }
@@ -752,6 +761,31 @@ export class PlayerController {
     dir.normalize();
     const origin = this.camera.position.clone().addScaledVector(dir, 0.45);
     this.projectiles.spawnGrenade(origin, dir.multiplyScalar(17.5), fuse, 'ally');
+  }
+
+  public throwSmokeGrenade(): boolean {
+    if (
+      this.hp <= 0 ||
+      this.mgMounted ||
+      this.isReloading ||
+      this.bandagingProgress > 0 ||
+      this.cookingGrenade ||
+      this.smokeGrenades <= 0
+    ) {
+      return false;
+    }
+
+    this.smokeGrenades--;
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+    dir.y += 0.22;
+    dir.normalize();
+    const origin = this.camera.position.clone().addScaledVector(dir, 0.45);
+    const vel = dir.multiplyScalar(16.5);
+    this.projectiles.spawnSmokeGrenade(origin, vel, 1.3);
+    this.fireCooldown = Math.max(this.fireCooldown, 0.25);
+    this.audio.playUiClick();
+    this.viewModel.triggerFire(0.05, 0.04, false);
+    return true;
   }
 
   private applyTouchAutoAimToDir(dir: THREE.Vector3, autoTarget: THREE.Vector3 | null): void {
