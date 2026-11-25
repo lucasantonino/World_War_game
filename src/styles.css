@@ -1566,12 +1566,19 @@ button {
     top: 52px;
     right: 12px;
     bottom: auto;
+    max-width: 196px;
     gap: 4px;
   }
 
-  .weapon-panel {
+  .hud-root:has(#touch-controls:not(.hidden)) .weapon-panel {
     min-width: 148px;
+    max-width: 196px;
     padding: 6px 9px;
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) #hud-extra-ammo {
+    font-size: 0.58rem !important;
+    line-height: 1.25;
   }
 
   .weapon-name {
@@ -1667,15 +1674,21 @@ button {
   }
 
   .hud-root:has(#touch-controls:not(.hidden)) .hud-bottom-left {
-    top: 122px;
+    top: 138px;
     left: 10px;
     max-width: 46vw;
   }
 
   .hud-root:has(#touch-controls:not(.hidden)) .hud-bottom-right {
-    top: 122px;
+    top: 138px;
     right: 10px;
     max-width: 46vw;
+  }
+
+  .hud-root:has(#touch-controls:not(.hidden)) .radio-caption {
+    top: 300px;
+    bottom: auto;
+    max-width: 88vw;
   }
 
   .hud-root:has(#touch-controls:not(.hidden)) #touch-btn-pause {
