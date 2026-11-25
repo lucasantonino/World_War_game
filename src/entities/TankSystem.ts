@@ -358,9 +358,9 @@ export class TankSystem {
           t.pos.x += (-Math.sin(t.hullYaw)) * speed * dt;
           t.pos.z += (-Math.cos(t.hullYaw)) * speed * dt;
 
-          // Crush barbed wire & sandbags in path
+          // Crush barbed wire, walls, buildings, trees, fences & sandbags in path
           this.cover.destroyWiresInRadius(t.pos.x, t.pos.z, 2.4);
-          this.cover.damageDestructiblesInRadius(t.pos, 2.5, 999);
+          this.cover.crushByTank(t.pos, 2.85 * (t.heavy ? 1.18 : 0.96));
         }
       }
 

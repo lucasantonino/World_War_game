@@ -1,4 +1,4 @@
-import { Crater, MissionConfig, MissionId, TrenchSegment } from '../types';
+import { Crater, DugoutSpec, MissionConfig, MissionId, TrenchSegment } from '../types';
 
 function makeMainAllyTrench(): TrenchSegment[] {
   return [
@@ -46,7 +46,7 @@ function makeMainAllyTrench(): TrenchSegment[] {
       x1: 0,
       z1: 30,
       x2: 0,
-      z2: 40,
+      z2: 41.5,
       width: 2.1,
       depth: 1.05,
       parapetSide: 'none',
@@ -54,6 +54,14 @@ function makeMainAllyTrench(): TrenchSegment[] {
       duckboards: true,
       faction: 'ally'
     }
+  ];
+}
+
+function makeStandardDugouts(): DugoutSpec[] {
+  return [
+    { id: 'dug_west', x: -16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north', label: 'ABRIGO OESTE' },
+    { id: 'dug_center', x: 0, z: 40.5, width: 4.8, depth: 4.0, floorY: -1.05, ceilingY: 0.55, openSide: 'north', label: 'ABRIGO CENTRAL' },
+    { id: 'dug_east', x: 16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north', label: 'ABRIGO LESTE' }
   ];
 }
 
@@ -113,10 +121,7 @@ export const MISSIONS: MissionConfig[] = [
     },
     playerSpawn: { x: -2, z: 30, yaw: 0 },
     trenches: makeMainAllyTrench(),
-    dugouts: [
-      { id: 'dug_west', x: -16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' },
-      { id: 'dug_east', x: 16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' }
-    ],
+    dugouts: makeStandardDugouts(),
     ramps: [
       { id: 'ramp_c', x1: 0, z1: 30, x2: 0, z2: 26.2, width: 2.2, y1: -1.05, y2: 0 },
       { id: 'ramp_e', x1: 22, z1: 31.2, x2: 22, z2: 27.6, width: 2.0, y1: -1.05, y2: 0 }
@@ -126,6 +131,27 @@ export const MISSIONS: MissionConfig[] = [
       { x: -14, z: 12, w: 3.6, h: 1.45, d: 0.7, rotY: 0.15 },
       { x: 13, z: 9, w: 4.2, h: 1.6, d: 0.75, rotY: -0.2 },
       { x: -3, z: -4, w: 4.8, h: 1.5, d: 0.8, rotY: 0.08 }
+    ],
+    buildings: [
+      { x: -22, z: 6, w: 5.2, h: 3.1, d: 4.4, rotY: 0.22 },
+      { x: 21, z: -3, w: 5.6, h: 3.3, d: 4.6, rotY: -0.18 }
+    ],
+    trees: [
+      { x: -32, z: 14, height: 4.6 },
+      { x: -27, z: -6, height: 4.2 },
+      { x: -12, z: -16, height: 4.8 },
+      { x: -34, z: -22, height: 5.0 },
+      { x: 15, z: 18, height: 4.1 },
+      { x: 29, z: 11, height: 4.7 },
+      { x: 33, z: -10, height: 4.5 },
+      { x: 18, z: -18, height: 4.3 },
+      { x: -4, z: -22, height: 4.4 }
+    ],
+    fences: [
+      { x: -29, z: 20, len: 6.5, rotY: 0.12 },
+      { x: 29, z: 19, len: 6.5, rotY: -0.15 },
+      { x: -26, z: -14, len: 6.0, rotY: 0.3 },
+      { x: 27, z: -14, len: 6.0, rotY: -0.25 }
     ],
     barbedWires: [
       { x: -18, z: 23, len: 10, rotY: 0.08 },
@@ -243,10 +269,7 @@ export const MISSIONS: MissionConfig[] = [
         faction: 'ally'
       }
     ],
-    dugouts: [
-      { id: 'dug_west', x: -16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' },
-      { id: 'dug_east', x: 16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' }
-    ],
+    dugouts: makeStandardDugouts(),
     ramps: [
       { id: 'ramp_c', x1: 0, z1: 30, x2: 0, z2: 26.2, width: 2.2, y1: -1.05, y2: 0 },
       { id: 'ramp_w', x1: -22, z1: 31.2, x2: -22, z2: 27.5, width: 2.2, y1: -1.05, y2: 0 }
@@ -258,6 +281,28 @@ export const MISSIONS: MissionConfig[] = [
       { x: 0, z: 1, w: 5.0, h: 1.65, d: 0.85, rotY: 0.05 },
       { x: -20, z: -6, w: 3.8, h: 1.5, d: 0.75, rotY: -0.15 },
       { x: 20, z: -8, w: 3.8, h: 1.5, d: 0.75, rotY: 0.18 }
+    ],
+    buildings: [
+      { x: -28, z: 2, w: 5.4, h: 3.2, d: 4.5, rotY: 0.16 },
+      { x: 27, z: 5, w: 5.2, h: 3.0, d: 4.2, rotY: -0.24 },
+      { x: 1, z: -16, w: 5.8, h: 3.2, d: 4.6, rotY: 0.08 }
+    ],
+    trees: [
+      { x: -35, z: 16, height: 4.5 },
+      { x: -33, z: -10, height: 4.9 },
+      { x: -23, z: -20, height: 4.3 },
+      { x: -4, z: 15, height: 4.0 },
+      { x: 6, z: -7, height: 4.4 },
+      { x: 34, z: 15, height: 4.7 },
+      { x: 32, z: -8, height: 4.6 },
+      { x: 24, z: -20, height: 4.2 },
+      { x: -36, z: -26, height: 5.0 }
+    ],
+    fences: [
+      { x: -31, z: 21, len: 6.5, rotY: 0.1 },
+      { x: 31, z: 21, len: 6.5, rotY: -0.1 },
+      { x: -31, z: -2, len: 5.5, rotY: 1.45 },
+      { x: 32, z: -1, len: 5.5, rotY: -1.42 }
     ],
     barbedWires: [
       { x: -24, z: 22, len: 8, rotY: 0.05 },
@@ -382,10 +427,7 @@ export const MISSIONS: MissionConfig[] = [
     },
     playerSpawn: { x: 0, z: 30, yaw: 0 },
     trenches: makeMainAllyTrench(),
-    dugouts: [
-      { id: 'dug_west', x: -16, z: 35.5, width: 5.2, depth: 4.4, floorY: -1.05, ceilingY: 0.55, openSide: 'north' },
-      { id: 'dug_east', x: 16, z: 35.5, width: 5.2, depth: 4.4, floorY: -1.05, ceilingY: 0.55, openSide: 'north' }
-    ],
+    dugouts: makeStandardDugouts(),
     ramps: [
       { id: 'ramp_c', x1: 0, z1: 30, x2: 0, z2: 26.2, width: 2.2, y1: -1.05, y2: 0 }
     ],
@@ -393,6 +435,26 @@ export const MISSIONS: MissionConfig[] = [
     ruins: [
       { x: -12, z: 8, w: 3.8, h: 1.5, d: 0.75, rotY: 0.1 },
       { x: 12, z: 10, w: 3.8, h: 1.5, d: 0.75, rotY: -0.15 }
+    ],
+    buildings: [
+      { x: -20, z: 4, w: 5.4, h: 3.2, d: 4.4, rotY: 0.2 },
+      { x: 20, z: -4, w: 5.5, h: 3.3, d: 4.5, rotY: -0.18 }
+    ],
+    trees: [
+      { x: -33, z: 14, height: 4.6 },
+      { x: -28, z: -10, height: 4.4 },
+      { x: -14, z: -18, height: 4.8 },
+      { x: 32, z: 12, height: 4.5 },
+      { x: 29, z: -14, height: 4.7 },
+      { x: 15, z: -20, height: 4.3 },
+      { x: -36, z: -24, height: 5.0 },
+      { x: 36, z: -26, height: 4.9 }
+    ],
+    fences: [
+      { x: -28, z: 18, len: 6.5, rotY: 0.15 },
+      { x: 28, z: 18, len: 6.5, rotY: -0.15 },
+      { x: -25, z: -16, len: 6.0, rotY: 0.22 },
+      { x: 25, z: -17, len: 6.0, rotY: -0.22 }
     ],
     barbedWires: [
       { x: -16, z: 23, len: 10, rotY: 0 },
@@ -405,7 +467,7 @@ export const MISSIONS: MissionConfig[] = [
       { id: 'ammo_3', kind: 'ammo_crate', x: -3, y: -1.05, z: 31, label: '[F] Reabastecer Munição e Foguetes', radius: 2.5, active: true },
       { id: 'med_3', kind: 'medic_crate', x: 4, y: -1.05, z: 31, label: '[F] Caixa Médica (+Curativos)', radius: 2.5, active: true },
       { id: 'mg_3', kind: 'mg_mount', x: -8, y: -1.05, z: 29.6, label: '[F] Assumir Metralhadora Pesada', radius: 2.2, active: true },
-      { id: 'radio_3', kind: 'radio', x: 0, y: -1.05, z: 38.5, label: '[F] Chamar Contra-Ataque pelo Rádio', radius: 2.5, active: false }
+      { id: 'radio_3', kind: 'radio', x: 1.5, y: -1.05, z: 39.2, label: '[F] Chamar Contra-Ataque pelo Rádio', radius: 2.5, active: false }
     ],
     allyCount: 7,
     phases: [
@@ -445,10 +507,10 @@ export const MISSIONS: MissionConfig[] = [
       {
         id: 'op3_p3',
         type: 'activate_radio',
-        objectiveText: 'ATIVE O RÁDIO DE CAMPO NA VALA TRASEIRA',
-        objectiveSubtext: 'Desça pela trincheira central até (Z +38) e pressione [F]',
-        objectiveTarget: { x: 0, z: 38.5 },
-        radioOpening: 'Nossas defesas estão em ruínas! Vá até o rádio na sapata traseira e peça apoio!'
+        objectiveText: 'ATIVE O RÁDIO DE CAMPO NO ABRIGO CENTRAL',
+        objectiveSubtext: 'Desça pela trincheira central até o Abrigo Central (Z +39) e pressione [F]',
+        objectiveTarget: { x: 1.5, z: 39.2 },
+        radioOpening: 'Nossas defesas estão em ruínas! Vá até o rádio no Abrigo Central e peça apoio!'
       },
       {
         id: 'op3_p4',
@@ -531,10 +593,7 @@ export const MISSIONS: MissionConfig[] = [
         faction: 'enemy'
       }
     ],
-    dugouts: [
-      { id: 'dug_west', x: -16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' },
-      { id: 'dug_east', x: 16, z: 35.5, width: 5.0, depth: 4.2, floorY: -1.05, ceilingY: 0.55, openSide: 'north' }
-    ],
+    dugouts: makeStandardDugouts(),
     ramps: [
       { id: 'ramp_c', x1: 0, z1: 30, x2: 0, z2: 26, width: 2.6, y1: -1.05, y2: 0 },
       { id: 'ramp_e', x1: 16, z1: 30.5, x2: 16, z2: 26.5, width: 2.2, y1: -1.05, y2: 0 },
@@ -552,6 +611,28 @@ export const MISSIONS: MissionConfig[] = [
     ruins: [
       { x: -8, z: 10, w: 4.0, h: 1.5, d: 0.75, rotY: 0.1 },
       { x: 9, z: -6, w: 4.2, h: 1.6, d: 0.75, rotY: -0.14 }
+    ],
+    buildings: [
+      { x: -24, z: 8, w: 5.2, h: 3.1, d: 4.4, rotY: 0.25 },
+      { x: 23, z: 5, w: 5.4, h: 3.2, d: 4.4, rotY: -0.2 },
+      { x: -22, z: -11, w: 4.8, h: 2.9, d: 4.0, rotY: 0.12 }
+    ],
+    trees: [
+      { x: -34, z: 16, height: 4.7 },
+      { x: -33, z: -4, height: 4.5 },
+      { x: -31, z: -18, height: 4.8 },
+      { x: 33, z: 16, height: 4.6 },
+      { x: 32, z: -3, height: 4.4 },
+      { x: 31, z: -17, height: 4.9 },
+      { x: -14, z: 18, height: 4.0 },
+      { x: 15, z: 17, height: 4.1 },
+      { x: 18, z: -12, height: 4.3 }
+    ],
+    fences: [
+      { x: -29, z: 22, len: 6.5, rotY: 0.08 },
+      { x: 29, z: 22, len: 6.5, rotY: -0.08 },
+      { x: -29, z: -15, len: 5.5, rotY: 0.18 },
+      { x: 29, z: -13, len: 5.5, rotY: -0.18 }
     ],
     barbedWires: [
       { x: -14, z: -19, len: 10, rotY: 0 },

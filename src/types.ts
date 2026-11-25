@@ -59,6 +59,8 @@ export interface DugoutSpec {
   floorY: number;
   ceilingY: number;
   openSide: 'north' | 'south';
+  label?: string;
+  damageStage?: DestructionStage;
 }
 
 export interface RampSpec {
@@ -79,10 +81,44 @@ export interface Crater {
   depth: number;
 }
 
+export interface TrenchCollapse {
+  x: number;
+  z: number;
+  radius: number;
+  depthLoss: number;
+}
+
+export interface BuildingSpec {
+  x: number;
+  z: number;
+  w: number;
+  h: number;
+  d: number;
+  rotY: number;
+}
+
+export interface TreePropSpec {
+  x: number;
+  z: number;
+  height?: number;
+}
+
+export interface FencePropSpec {
+  x: number;
+  z: number;
+  len: number;
+  rotY: number;
+}
+
+export type DestructionStage = 0 | 1 | 2;
+
 export type DestructibleKind =
   | 'sandbag'
   | 'wire'
   | 'ruin'
+  | 'building'
+  | 'tree'
+  | 'fence'
   | 'bunker_mg'
   | 'bunker_main'
   | 'crate_prop';
@@ -102,6 +138,7 @@ export interface DestructibleSpec {
   blocksMovement: boolean;
   blocksSight: boolean;
   rotationY?: number;
+  stage?: DestructionStage;
 }
 
 export interface EmplacementSpec {
@@ -184,6 +221,9 @@ export interface MissionConfig {
   ramps: RampSpec[];
   initialCraters: Crater[];
   ruins: Array<{ x: number; z: number; w: number; h: number; d: number; rotY: number }>;
+  buildings?: BuildingSpec[];
+  trees?: TreePropSpec[];
+  fences?: FencePropSpec[];
   barbedWires: Array<{ x: number; z: number; len: number; rotY: number }>;
   bunkers: Array<{
     id: string;

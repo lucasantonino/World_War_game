@@ -101,6 +101,13 @@ export class GameEngine {
     this.cover = new CoverSystem(this.terrain);
     this.envBuilder = new EnvironmentBuilder(this.scene, this.terrain, this.cover);
     this.vfx = new VFXSystem(this.scene);
+    this.cover.setOnDestructibleStageChanged((spec, stage) => {
+      this.vfx.spawnStructuralDebris(
+        new THREE.Vector3(spec.x, spec.y + spec.height * 0.5, spec.z),
+        spec.kind,
+        stage
+      );
+    });
     this.projectiles = new ProjectileSystem(this.scene, this.terrain, this.cover, this.vfx, this.audio);
     this.player = new PlayerController(
       this.camera,
@@ -458,6 +465,44 @@ export class GameEngine {
     this.terrain.addCrater(center.x, center.z, craterRadius, craterDepth);
     this.cover.destroyWiresInRadius(center.x, center.z, radius * 0.75);
     this.cover.damageDestructiblesInRadius(center, radius * 0.85, maxDamage * 1.15);
+
+    if (craterRadius >= 1.8) {
+      if (this.terrain.collapseTrenchAt(center.x, center.z, radius * 0.7)) {
+        this.envBuilder.setTrenchWallCollapsedAt(center.x, center.z, radius * 0.7);
+        this.vfx.spawnTrenchCollapseDebris(center);
+      }
+    }
+
+    if (radius >= 5.5) {
+      const dugHit = this.terrain.damageDugoutAt(center.x, center.z, radius);
+      if (dugHit) {
+        this.envBuilder.setDugoutStage(dugHit.dugout.id, dugHit.newStage);
+        this.vfx.spawnDugoutCollapseDebris(
+          new THREE.Vector3(dugHit.dugout.x, dugHit.dugout.ceilingY, dugHit.dugout.z),
+          dugHit.newStage === 2
+        );
+        const label = dugHit.dugout.label ?? 'ABRIGO';
+        if (dugHit.newStage === 1) {
+          this.pushRadioCaption(`${label} COMPROMETIDO! O teto vai ceder no próximo impacto!`);
+          this.player.addShake(0.65);
+        } else {
+          this.pushRadioCaption(`${label} DESTRUÍDO! MUDE PARA OUTRO ABRIGO!`);
+          const inThisDugout =
+            Math.abs(this.player.pos.x - dugHit.dugout.x) <= dugHit.dugout.width * 0.56 &&
+            Math.abs(this.player.pos.z - dugHit.dugout.z) <= dugHit.dugout.depth * 0.56;
+          if (inThisDugout) {
+            const diffConfig = getDifficultyConfig(this.settings.difficulty);
+            this.player.applyDamage(
+              65,
+              center,
+              'Soterrado pelo desabamento do abrigo subterrâneo',
+              true,
+              diffConfig
+            );
+          }
+        }
+      }
+    }
 
     this.vfx.spawnExplosion(center, Math.max(0.85, radius / 6.2));
     const distToPlayer = center.distanceTo(this.player.pos);

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { getProceduralTextures } from '../engine/Textures';
-import { DestructibleSpec, MissionConfig, QualityLevel } from '../types';
+import { DestructibleSpec, DestructionStage, MissionConfig, QualityLevel } from '../types';
 import { CoverSystem } from './CoverSystem';
 import { Terrain } from './Terrain';
 
@@ -17,6 +17,22 @@ export class EnvironmentBuilder {
   private animatedProps: AnimatedProp[] = [];
   private interactableMeshes = new Map<string, THREE.Object3D>();
   private mgBarrelMeshes = new Map<string, THREE.Object3D>();
+  private trenchStakes: Array<{ x: number; z: number; mesh: THREE.Mesh; collapsed: boolean }> = [];
+  private dugoutVisuals = new Map<
+    string,
+    {
+      roof: THREE.Mesh;
+      roofBags: THREE.Mesh;
+      lantern: THREE.PointLight;
+      bulb: THREE.Mesh;
+      sign: THREE.Mesh;
+      rubble: THREE.Mesh;
+      stage: DestructionStage;
+    }
+  >();
+  private disposableTextures: THREE.Texture[] = [];
+  private timberMat: THREE.Material | null = null;
+  private mudCollapseMat: THREE.Material | null = null;
   private bunkerMainGroup: THREE.Group | null = null;
   private sunLight: THREE.DirectionalLight | null = null;
   private hemiLight: THREE.HemisphereLight | null = null;
@@ -35,8 +51,17 @@ export class EnvironmentBuilder {
     this.animatedProps = [];
     this.interactableMeshes.clear();
     this.mgBarrelMeshes.clear();
+    this.trenchStakes = [];
+    this.dugoutVisuals.clear();
     this.bunkerMainGroup = null;
     this.rainPoints = null;
+    this.timberMat = null;
+    this.mudCollapseMat = null;
+
+    for (const tex of this.disposableTextures) {
+      tex.dispose();
+    }
+    this.disposableTextures = [];
 
     while (this.rootGroup.children.length > 0) {
       const child = this.rootGroup.children[0];
@@ -106,6 +131,18 @@ export class EnvironmentBuilder {
       roughness: 0.65,
       metalness: 0.45
     });
+    const darkWindowMat = new THREE.MeshStandardMaterial({
+      color: 0x111214,
+      roughness: 0.95,
+      metalness: 0.05
+    });
+    this.timberMat = timberMat;
+    this.mudCollapseMat = new THREE.MeshStandardMaterial({
+      map: tex.mud,
+      color: 0x6f5a46,
+      roughness: 0.96,
+      metalness: 0.02
+    });
 
     // 1. Trenches (duckboards, timber walls, destructible sandbag parapets)
     this.buildTrenches(config, timberMat, sandbagMat);
@@ -113,57 +150,34 @@ export class EnvironmentBuilder {
     // 2. Dugouts (safe overhead shelters with warm lantern light)
     this.buildDugouts(config, timberMat, sandbagMat);
 
-    // 3. Ruins
-    for (let i = 0; i < config.ruins.length; i++) {
-      const r = config.ruins[i];
-      const baseY = this.terrain.getTerrainHeight(r.x, r.z);
-      const geo = new THREE.BoxGeometry(r.w, r.h, r.d);
-      const mesh = new THREE.Mesh(geo, concreteMat);
-      mesh.position.set(r.x, baseY + r.h * 0.45, r.z);
-      mesh.rotation.y = r.rotY;
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      this.rootGroup.add(mesh);
+    // 3. Ruins & Bombed Buildings (3-stage destructibles)
+    this.buildRuins(config, concreteMat);
+    this.buildBuildings(config, concreteMat, timberMat, darkWindowMat);
 
-      const spec: DestructibleSpec = {
-        id: `ruin_${i}`,
-        kind: 'ruin',
-        x: r.x,
-        y: baseY,
-        z: r.z,
-        width: r.w,
-        height: r.h,
-        depth: r.d,
-        hp: 260,
-        maxHp: 260,
-        blocksBullets: true,
-        blocksMovement: true,
-        blocksSight: true,
-        rotationY: r.rotY
-      };
-      this.cover.registerDestructible(spec, mesh);
-    }
+    // 4. Destructible Trees & Fences
+    this.buildTrees(config, timberMat);
+    this.buildFences(config, timberMat);
 
-    // 4. Barbed wire entanglements
+    // 5. Barbed wire entanglements
     this.buildBarbedWires(config, timberMat, steelMat);
 
-    // 5. Bunkers
+    // 6. Bunkers
     this.buildBunkers(config, concreteMat, steelMat);
 
-    // 6. Emplacements (tripod MGs)
+    // 7. Emplacements (tripod MGs)
     for (const emp of [...config.allyEmplacements, ...config.enemyEmplacements]) {
       const mgGroup = this.buildHeavyMGProp(emp.x, emp.y, emp.z, emp.yaw, steelMat);
       this.rootGroup.add(mgGroup);
       this.mgBarrelMeshes.set(emp.id, mgGroup);
     }
 
-    // 7. Interactables (Ammo, Medic, Radio, Bunker Charge point)
+    // 8. Interactables (Ammo, Medic, Radio, Bunker Charge point)
     this.buildInteractables(config, tex, timberMat);
 
-    // 8. Shattered dead trees & distant battlefield silhouette backdrop
-    this.buildBattlefieldAtmosphereProps(timberMat, steelMat);
+    // 9. Shattered dead trees fallback & anti-tank hedgehogs
+    this.buildBattlefieldAtmosphereProps(config, timberMat, steelMat);
 
-    // 9. Atmospheric effects (Rain, Flares, Searchlights)
+    // 10. Atmospheric effects (Rain, Flares, Searchlights)
     if (env.hasRain) {
       this.buildRain();
     }
@@ -253,6 +267,7 @@ export class EnvironmentBuilder {
           post.position.set(sx, sy + 0.35, sz);
           post.castShadow = true;
           this.rootGroup.add(post);
+          this.trenchStakes.push({ x: sx, z: sz, mesh: post, collapsed: false });
         }
       }
 
@@ -272,19 +287,40 @@ export class EnvironmentBuilder {
           bagGroup.position.set(bx, by, bz);
           bagGroup.rotation.y = Math.atan2(dz, -dx);
 
-          // Stacked 2 rows of sandbags
-          for (let row = 0; row < 2; row++) {
-            for (let col = -1; col <= 1; col++) {
-              const bag = new THREE.Mesh(
-                new THREE.BoxGeometry(0.68, 0.24, 0.44),
-                sandbagMat
-              );
-              bag.position.set(col * 0.68 + (row % 2) * 0.12, 0.12 + row * 0.22, (row % 2) * 0.04);
-              bag.castShadow = true;
-              bag.receiveShadow = true;
-              bagGroup.add(bag);
-            }
+          const bottomRowGroup = new THREE.Group();
+          const topRowGroup = new THREE.Group();
+          const rubbleGroup = new THREE.Group();
+          rubbleGroup.visible = false;
+
+          for (let col = -1; col <= 1; col++) {
+            const bottomBag = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.24, 0.44), sandbagMat);
+            bottomBag.position.set(col * 0.68, 0.12, 0);
+            bottomBag.castShadow = true;
+            bottomBag.receiveShadow = true;
+            bottomRowGroup.add(bottomBag);
+
+            const topBag = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.24, 0.44), sandbagMat);
+            topBag.position.set(col * 0.68 + 0.12, 0.34, 0.04);
+            topBag.castShadow = true;
+            topBag.receiveShadow = true;
+            topRowGroup.add(topBag);
           }
+
+          // Burst/collapsed sandbag rubble for stage 2
+          for (let r = 0; r < 5; r++) {
+            const burstBag = new THREE.Mesh(
+              new THREE.BoxGeometry(0.46, 0.11, 0.34),
+              sandbagMat
+            );
+            burstBag.position.set(-0.7 + r * 0.36, 0.055 + (r % 2) * 0.03, ((r % 3) - 1) * 0.1);
+            burstBag.rotation.set((r % 2 ? 1 : -1) * 0.08, r * 0.45, (r % 2 ? -1 : 1) * 0.12);
+            burstBag.receiveShadow = true;
+            rubbleGroup.add(burstBag);
+          }
+
+          bagGroup.add(bottomRowGroup);
+          bagGroup.add(topRowGroup);
+          bagGroup.add(rubbleGroup);
           this.rootGroup.add(bagGroup);
 
           const spec: DestructibleSpec = {
@@ -302,7 +338,16 @@ export class EnvironmentBuilder {
             blocksMovement: false,
             blocksSight: false
           };
-          this.cover.registerDestructible(spec, bagGroup);
+          this.cover.registerDestructible(spec, bagGroup, (stage: DestructionStage) => {
+            if (stage === 1) {
+              topRowGroup.visible = false;
+              bottomRowGroup.rotation.z = 0.08;
+            } else if (stage === 2) {
+              topRowGroup.visible = false;
+              bottomRowGroup.visible = false;
+              rubbleGroup.visible = true;
+            }
+          });
         }
       }
     }
@@ -413,6 +458,7 @@ export class EnvironmentBuilder {
       group.add(bulb);
 
       // Painted wood "ABRIGO" sign on entrance header
+      const signLabel = d.label ?? 'ABRIGO';
       const signCanvas = document.createElement('canvas');
       signCanvas.width = 256;
       signCanvas.height = 64;
@@ -424,13 +470,14 @@ export class EnvironmentBuilder {
         sctx.lineWidth = 4;
         sctx.strokeRect(4, 4, 248, 56);
         sctx.fillStyle = '#f2dec0';
-        sctx.font = 'bold 34px Oswald, sans-serif';
+        sctx.font = signLabel.length > 8 ? 'bold 24px Oswald, sans-serif' : 'bold 34px Oswald, sans-serif';
         sctx.textAlign = 'center';
         sctx.textBaseline = 'middle';
-        sctx.fillText('ABRIGO', 128, 34);
+        sctx.fillText(signLabel, 128, 34);
       }
       const signTex = new THREE.CanvasTexture(signCanvas);
       signTex.colorSpace = THREE.SRGBColorSpace;
+      this.disposableTextures.push(signTex);
       const sign = new THREE.Mesh(
         new THREE.PlaneGeometry(1.5, 0.38),
         new THREE.MeshBasicMaterial({ map: signTex })
@@ -440,13 +487,446 @@ export class EnvironmentBuilder {
       if (d.openSide === 'south') sign.rotation.y = Math.PI;
       group.add(sign);
 
+      // Collapsed entrance rubble (hidden until stage 2)
+      const entranceZ = d.openSide === 'north' ? d.z - d.depth * 0.4 : d.z + d.depth * 0.4;
+      const rubble = new THREE.Mesh(
+        new THREE.BoxGeometry(d.width * 0.86, 0.92, 1.35),
+        sandbagMat
+      );
+      rubble.position.set(d.x, d.floorY + 0.46, entranceZ);
+      rubble.castShadow = true;
+      rubble.receiveShadow = true;
+      rubble.visible = false;
+
+      const beamDebris = new THREE.Mesh(
+        new THREE.BoxGeometry(d.width * 0.9, 0.24, 0.32),
+        timberMat
+      );
+      beamDebris.position.set(0, 0.42, -0.15);
+      beamDebris.rotation.set(0.24, 0.08, -0.16);
+      rubble.add(beamDebris);
+      group.add(rubble);
+
+      this.dugoutVisuals.set(d.id, {
+        roof,
+        roofBags,
+        lantern,
+        bulb,
+        sign,
+        rubble,
+        stage: 0
+      });
+
+      if (d.damageStage) {
+        this.setDugoutStage(d.id, d.damageStage);
+      }
+
       this.animatedProps.push({
         update: (_dt, elapsed) => {
-          lantern.intensity = 2.0 + Math.sin(elapsed * 9.5 + d.x) * 0.22;
+          const v = this.dugoutVisuals.get(d.id);
+          if (!v) return;
+          if (v.stage === 2) {
+            v.lantern.intensity = 0;
+          } else if (v.stage === 1) {
+            const flicker =
+              Math.sin(elapsed * 23.0 + d.x) * Math.cos(elapsed * 37.0 + d.z) > -0.25 ? 1.55 : 0.25;
+            v.lantern.intensity = flicker + Math.sin(elapsed * 14.0) * 0.25;
+          } else {
+            v.lantern.intensity = 2.0 + Math.sin(elapsed * 9.5 + d.x) * 0.22;
+          }
         }
       });
 
       this.rootGroup.add(group);
+    }
+  }
+
+  private buildRuins(config: MissionConfig, concreteMat: THREE.Material): void {
+    for (let i = 0; i < config.ruins.length; i++) {
+      const r = config.ruins[i];
+      const baseY = this.terrain.getTerrainHeight(r.x, r.z);
+      const group = new THREE.Group();
+      group.position.set(r.x, baseY, r.z);
+      group.rotation.y = r.rotY;
+
+      const midSection = new THREE.Group();
+      const midH = r.h * 0.56;
+      const lowerWall = new THREE.Mesh(new THREE.BoxGeometry(r.w, midH, r.d), concreteMat);
+      lowerWall.position.y = midH * 0.5;
+      lowerWall.castShadow = true;
+      lowerWall.receiveShadow = true;
+      midSection.add(lowerWall);
+
+      const topSection = new THREE.Group();
+      const topH = r.h * 0.44;
+      const leftTop = new THREE.Mesh(new THREE.BoxGeometry(r.w * 0.46, topH, r.d * 0.96), concreteMat);
+      leftTop.position.set(-r.w * 0.25, midH + topH * 0.5, 0);
+      leftTop.castShadow = true;
+      leftTop.receiveShadow = true;
+      topSection.add(leftTop);
+
+      const rightTop = new THREE.Mesh(new THREE.BoxGeometry(r.w * 0.36, topH * 0.78, r.d * 0.96), concreteMat);
+      rightTop.position.set(r.w * 0.28, midH + topH * 0.39, 0);
+      rightTop.castShadow = true;
+      rightTop.receiveShadow = true;
+      topSection.add(rightTop);
+
+      const rubbleBase = new THREE.Group();
+      rubbleBase.visible = false;
+      const baseMound = new THREE.Mesh(new THREE.BoxGeometry(r.w * 0.95, 0.24, r.d * 1.25), concreteMat);
+      baseMound.position.y = 0.12;
+      baseMound.receiveShadow = true;
+      rubbleBase.add(baseMound);
+      for (let c = 0; c < 4; c++) {
+        const chunk = new THREE.Mesh(new THREE.BoxGeometry(r.w * 0.22, 0.22, r.d * 0.8), concreteMat);
+        chunk.position.set((-0.34 + c * 0.23) * r.w, 0.22, (c % 2 === 0 ? 1 : -1) * 0.12);
+        chunk.rotation.set(0.2 * (c % 2 ? 1 : -1), c * 0.6, 0.25 * (c % 2 ? -1 : 1));
+        chunk.castShadow = true;
+        chunk.receiveShadow = true;
+        rubbleBase.add(chunk);
+      }
+
+      group.add(midSection);
+      group.add(topSection);
+      group.add(rubbleBase);
+      this.rootGroup.add(group);
+
+      const spec: DestructibleSpec = {
+        id: `ruin_${i}`,
+        kind: 'ruin',
+        x: r.x,
+        y: baseY,
+        z: r.z,
+        width: r.w,
+        height: r.h,
+        depth: r.d,
+        hp: 260,
+        maxHp: 260,
+        blocksBullets: true,
+        blocksMovement: true,
+        blocksSight: true,
+        rotationY: r.rotY
+      };
+      this.cover.registerDestructible(spec, group, (stage: DestructionStage) => {
+        if (stage === 1) {
+          topSection.visible = false;
+          midSection.rotation.z = 0.06;
+        } else if (stage === 2) {
+          topSection.visible = false;
+          midSection.visible = false;
+          rubbleBase.visible = true;
+        }
+      });
+    }
+  }
+
+  private buildBuildings(
+    config: MissionConfig,
+    concreteMat: THREE.Material,
+    timberMat: THREE.Material,
+    darkWindowMat: THREE.Material
+  ): void {
+    const buildings = config.buildings ?? [];
+    for (let i = 0; i < buildings.length; i++) {
+      const b = buildings[i];
+      const baseY = this.terrain.getTerrainHeight(b.x, b.z);
+      const group = new THREE.Group();
+      group.position.set(b.x, baseY, b.z);
+      group.rotation.y = b.rotY;
+
+      const wallT = 0.34;
+      const midH = b.h * 0.54;
+      const topH = b.h - midH;
+
+      const midSection = new THREE.Group();
+      // Front and back lower masonry walls
+      for (const zSide of [-1, 1]) {
+        const wall = new THREE.Mesh(new THREE.BoxGeometry(b.w, midH, wallT), concreteMat);
+        wall.position.set(0, midH * 0.5, zSide * (b.d * 0.5 - wallT * 0.5));
+        wall.castShadow = true;
+        wall.receiveShadow = true;
+        midSection.add(wall);
+
+        // Dark windows on front/back lower walls
+        for (const wx of [-b.w * 0.28, b.w * 0.28]) {
+          const win = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.72, wallT + 0.05), darkWindowMat);
+          win.position.set(wx, midH * 0.56, zSide * (b.d * 0.5 - wallT * 0.5));
+          midSection.add(win);
+        }
+      }
+      // Side lower masonry walls + dark windows
+      for (const xSide of [-1, 1]) {
+        const sideWall = new THREE.Mesh(new THREE.BoxGeometry(wallT, midH, b.d - wallT * 2), concreteMat);
+        sideWall.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.5, 0);
+        sideWall.castShadow = true;
+        sideWall.receiveShadow = true;
+        midSection.add(sideWall);
+
+        const sideWin = new THREE.Mesh(new THREE.BoxGeometry(wallT + 0.05, 0.72, 0.85), darkWindowMat);
+        sideWin.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.56, 0);
+        midSection.add(sideWin);
+      }
+
+      const topSection = new THREE.Group();
+      // Upper front/back broken masonry walls
+      const upperFront = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.88, topH, wallT), concreteMat);
+      upperFront.position.set(-b.w * 0.04, midH + topH * 0.5, -(b.d * 0.5 - wallT * 0.5));
+      upperFront.castShadow = true;
+      upperFront.receiveShadow = true;
+      topSection.add(upperFront);
+
+      const upperBack = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.72, topH * 0.85, wallT), concreteMat);
+      upperBack.position.set(b.w * 0.1, midH + topH * 0.42, b.d * 0.5 - wallT * 0.5);
+      upperBack.castShadow = true;
+      upperBack.receiveShadow = true;
+      topSection.add(upperBack);
+
+      // Upper dark windows
+      for (const wx of [-b.w * 0.24, b.w * 0.18]) {
+        const uWin = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.65, wallT + 0.05), darkWindowMat);
+        uWin.position.set(wx, midH + topH * 0.45, -(b.d * 0.5 - wallT * 0.5));
+        topSection.add(uWin);
+      }
+
+      // Side upper walls (partially collapsed)
+      for (const xSide of [-1, 1]) {
+        const uSide = new THREE.Mesh(
+          new THREE.BoxGeometry(wallT, topH * 0.75, b.d * 0.65),
+          concreteMat
+        );
+        uSide.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH + topH * 0.37, -b.d * 0.12);
+        uSide.castShadow = true;
+        topSection.add(uSide);
+      }
+
+      // Charred wooden roof beams & tilted rafters
+      for (let r = -1; r <= 1; r++) {
+        const beam = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, b.d + 0.25), timberMat);
+        beam.position.set(r * (b.w * 0.32), b.h - 0.05, 0);
+        beam.rotation.z = r * 0.08;
+        beam.rotation.x = r === 0 ? 0.12 : -0.06;
+        beam.castShadow = true;
+        topSection.add(beam);
+      }
+      const ridgeBeam = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.96, 0.18, 0.18), timberMat);
+      ridgeBeam.position.set(0, b.h + 0.12, 0);
+      ridgeBeam.rotation.z = -0.04;
+      ridgeBeam.castShadow = true;
+      topSection.add(ridgeBeam);
+
+      // Stage 2 rubble base
+      const rubbleBase = new THREE.Group();
+      rubbleBase.visible = false;
+      const foundation = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.96, 0.34, b.d * 0.96), concreteMat);
+      foundation.position.y = 0.17;
+      foundation.receiveShadow = true;
+      rubbleBase.add(foundation);
+
+      for (let c = 0; c < 6; c++) {
+        const masonry = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.32, 0.72), concreteMat);
+        masonry.position.set(
+          ((c % 3) - 1) * (b.w * 0.28),
+          0.34 + (c % 2) * 0.12,
+          (c < 3 ? -1 : 1) * (b.d * 0.22)
+        );
+        masonry.rotation.set(0.2 * (c % 2 ? 1 : -1), c * 0.55, 0.18);
+        masonry.castShadow = true;
+        rubbleBase.add(masonry);
+      }
+      for (let t = 0; t < 2; t++) {
+        const fallenBeam = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.72, 0.14, 0.16), timberMat);
+        fallenBeam.position.set((t === 0 ? -0.4 : 0.4), 0.44, (t === 0 ? -0.35 : 0.45));
+        fallenBeam.rotation.set(0.12, 0.4 + t * 0.9, 0.22);
+        fallenBeam.castShadow = true;
+        rubbleBase.add(fallenBeam);
+      }
+
+      group.add(midSection);
+      group.add(topSection);
+      group.add(rubbleBase);
+      this.rootGroup.add(group);
+
+      const spec: DestructibleSpec = {
+        id: `building_${i}`,
+        kind: 'building',
+        x: b.x,
+        y: baseY,
+        z: b.z,
+        width: b.w,
+        height: b.h,
+        depth: b.d,
+        hp: 380,
+        maxHp: 380,
+        blocksBullets: true,
+        blocksMovement: true,
+        blocksSight: true,
+        rotationY: b.rotY
+      };
+      this.cover.registerDestructible(spec, group, (stage: DestructionStage) => {
+        if (stage === 1) {
+          topSection.visible = false;
+          midSection.rotation.z = 0.06;
+        } else if (stage === 2) {
+          topSection.visible = false;
+          midSection.visible = false;
+          rubbleBase.visible = true;
+        }
+      });
+    }
+  }
+
+  private buildTrees(config: MissionConfig, timberMat: THREE.Material): void {
+    const trees = config.trees ?? [];
+    for (let i = 0; i < trees.length; i++) {
+      const t = trees[i];
+      const baseY = this.terrain.getTerrainHeight(t.x, t.z);
+      const treeHeight = t.height ?? 4.4;
+
+      const treeGroup = new THREE.Group();
+      treeGroup.position.set(t.x, baseY, t.z);
+
+      // Trunk pivoted at base (y = 0)
+      const trunkPivot = new THREE.Group();
+      const trunk = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.16, 0.32, treeHeight, 7),
+        timberMat
+      );
+      trunk.position.y = treeHeight * 0.5;
+      trunk.castShadow = true;
+      trunk.receiveShadow = true;
+      trunkPivot.add(trunk);
+
+      const branch1 = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.13, 1.65, 5), timberMat);
+      branch1.position.set(0.48, treeHeight * 0.65, 0.08);
+      branch1.rotation.z = -0.78;
+      branch1.castShadow = true;
+      trunkPivot.add(branch1);
+
+      const branch2 = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.1, 1.25, 5), timberMat);
+      branch2.position.set(-0.36, treeHeight * 0.78, -0.14);
+      branch2.rotation.z = 0.85;
+      branch2.rotation.y = 0.4;
+      branch2.castShadow = true;
+      trunkPivot.add(branch2);
+
+      treeGroup.add(trunkPivot);
+      this.rootGroup.add(treeGroup);
+
+      let fallen = false;
+      let fallProgress = 0;
+      const fallDir = i % 2 === 0 ? 1 : -1;
+
+      this.animatedProps.push({
+        update: (dt) => {
+          if (fallen && fallProgress < 1) {
+            fallProgress = Math.min(1, fallProgress + dt * 2.1);
+            const eased = fallProgress * fallProgress;
+            trunkPivot.rotation.z = fallDir * (0.12 + (1.48 - 0.12) * eased);
+          }
+        }
+      });
+
+      this.cover.registerDestructible(
+        {
+          id: `tree_${i}`,
+          kind: 'tree',
+          x: t.x,
+          y: baseY,
+          z: t.z,
+          width: 0.72,
+          height: treeHeight,
+          depth: 0.72,
+          hp: 65,
+          maxHp: 65,
+          blocksBullets: true,
+          blocksMovement: true,
+          blocksSight: false
+        },
+        treeGroup,
+        (stage: DestructionStage) => {
+          if (stage === 1) {
+            trunkPivot.rotation.z = fallDir * 0.12;
+          } else if (stage === 2) {
+            fallen = true;
+          }
+        }
+      );
+    }
+  }
+
+  private buildFences(config: MissionConfig, timberMat: THREE.Material): void {
+    const fences = config.fences ?? [];
+    for (let i = 0; i < fences.length; i++) {
+      const f = fences[i];
+      const baseY = this.terrain.getTerrainHeight(f.x, f.z);
+
+      const fenceGroup = new THREE.Group();
+      fenceGroup.position.set(f.x, baseY, f.z);
+      fenceGroup.rotation.y = f.rotY;
+
+      // Posts + horizontal boards pivoted at base (y = 0)
+      const pivotGroup = new THREE.Group();
+      const postCount = Math.max(2, Math.round(f.len / 1.8) + 1);
+      for (let p = 0; p < postCount; p++) {
+        const px = -f.len * 0.46 + (p / (postCount - 1)) * (f.len * 0.92);
+        const post = new THREE.Mesh(new THREE.BoxGeometry(0.12, 1.05, 0.12), timberMat);
+        post.position.set(px, 0.525, 0);
+        post.castShadow = true;
+        post.receiveShadow = true;
+        pivotGroup.add(post);
+      }
+
+      for (const railY of [0.36, 0.78]) {
+        const rail = new THREE.Mesh(new THREE.BoxGeometry(f.len, 0.12, 0.05), timberMat);
+        rail.position.set(0, railY, 0.05);
+        rail.castShadow = true;
+        rail.receiveShadow = true;
+        pivotGroup.add(rail);
+      }
+
+      fenceGroup.add(pivotGroup);
+      this.rootGroup.add(fenceGroup);
+
+      let fallen = false;
+      let fallProgress = 0;
+      const fallDir = i % 2 === 0 ? 1 : -1;
+
+      this.animatedProps.push({
+        update: (dt) => {
+          if (fallen && fallProgress < 1) {
+            fallProgress = Math.min(1, fallProgress + dt * 2.8);
+            const eased = fallProgress * fallProgress;
+            pivotGroup.rotation.x = fallDir * (0.14 + (1.46 - 0.14) * eased);
+          }
+        }
+      });
+
+      this.cover.registerDestructible(
+        {
+          id: `fence_${i}`,
+          kind: 'fence',
+          x: f.x,
+          y: baseY,
+          z: f.z,
+          width: f.len,
+          height: 1.05,
+          depth: 0.25,
+          hp: 45,
+          maxHp: 45,
+          blocksBullets: false,
+          blocksMovement: true,
+          blocksSight: false,
+          rotationY: f.rotY
+        },
+        fenceGroup,
+        (stage: DestructionStage) => {
+          if (stage === 1) {
+            pivotGroup.rotation.x = fallDir * 0.14;
+          } else if (stage === 2) {
+            fallen = true;
+          }
+        }
+      );
     }
   }
 
@@ -673,35 +1153,38 @@ export class EnvironmentBuilder {
   }
 
   private buildBattlefieldAtmosphereProps(
+    config: MissionConfig,
     timberMat: THREE.Material,
     steelMat: THREE.Material
   ): void {
-    const deadTreeSpots = [
-      [-36, 10],
-      [-32, -12],
-      [34, 8],
-      [36, -15],
-      [-42, -26],
-      [40, -30]
-    ];
+    if (!config.trees || config.trees.length === 0) {
+      const deadTreeSpots = [
+        [-36, 10],
+        [-32, -12],
+        [34, 8],
+        [36, -15],
+        [-42, -26],
+        [40, -30]
+      ];
 
-    for (const [tx, tz] of deadTreeSpots) {
-      const ty = this.terrain.getTerrainHeight(tx, tz);
-      const tree = new THREE.Group();
-      tree.position.set(tx, ty, tz);
+      for (const [tx, tz] of deadTreeSpots) {
+        const ty = this.terrain.getTerrainHeight(tx, tz);
+        const tree = new THREE.Group();
+        tree.position.set(tx, ty, tz);
 
-      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.34, 4.2, 7), timberMat);
-      trunk.position.y = 2.0;
-      trunk.rotation.z = (tx > 0 ? -1 : 1) * 0.08;
-      trunk.castShadow = true;
-      tree.add(trunk);
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.34, 4.2, 7), timberMat);
+        trunk.position.y = 2.0;
+        trunk.rotation.z = (tx > 0 ? -1 : 1) * 0.08;
+        trunk.castShadow = true;
+        tree.add(trunk);
 
-      const branch = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.14, 1.8, 5), timberMat);
-      branch.position.set(0.55, 2.7, 0.1);
-      branch.rotation.z = -0.78;
-      tree.add(branch);
+        const branch = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.14, 1.8, 5), timberMat);
+        branch.position.set(0.55, 2.7, 0.1);
+        branch.rotation.z = -0.78;
+        tree.add(branch);
 
-      this.rootGroup.add(tree);
+        this.rootGroup.add(tree);
+      }
     }
 
     // Anti-tank Czech hedgehogs along flanks
@@ -810,6 +1293,68 @@ export class EnvironmentBuilder {
           beam.rotation.x = -0.18 + Math.cos(elapsed * 0.55 + phase) * 0.1;
         }
       });
+    }
+  }
+
+  public setTrenchWallCollapsedAt(x: number, z: number, radius: number): void {
+    const limit = radius + 1.2;
+    const limitSq = limit * limit;
+    let idx = 0;
+
+    for (const stake of this.trenchStakes) {
+      idx++;
+      if (stake.collapsed) continue;
+      const dx = stake.x - x;
+      const dz = stake.z - z;
+      if (dx * dx + dz * dz > limitSq) continue;
+
+      stake.collapsed = true;
+      const dir = idx % 2 === 0 ? 1 : -1;
+      stake.mesh.rotation.z = dir * 0.65;
+      stake.mesh.rotation.x = 0.35;
+      stake.mesh.position.y -= 0.28;
+
+      const baseY = this.terrain.getTerrainHeight(stake.x, stake.z);
+      const dirtMound = new THREE.Mesh(
+        new THREE.BoxGeometry(0.74, 0.28, 0.64),
+        this.mudCollapseMat ?? new THREE.MeshStandardMaterial({ color: 0x3b2f24, roughness: 0.96 })
+      );
+      dirtMound.position.set(stake.x, baseY + 0.12, stake.z);
+      dirtMound.rotation.y = (idx * 0.7) % Math.PI;
+      dirtMound.castShadow = true;
+      dirtMound.receiveShadow = true;
+      this.rootGroup.add(dirtMound);
+
+      const brokenPlank = new THREE.Mesh(
+        new THREE.BoxGeometry(0.86, 0.08, 0.2),
+        this.timberMat ?? new THREE.MeshStandardMaterial({ color: 0x4b3828, roughness: 0.9 })
+      );
+      brokenPlank.position.set(stake.x + dir * 0.14, baseY + 0.25, stake.z);
+      brokenPlank.rotation.set(0.22, dir * 0.5, dir * 0.28);
+      brokenPlank.castShadow = true;
+      brokenPlank.receiveShadow = true;
+      this.rootGroup.add(brokenPlank);
+    }
+  }
+
+  public setDugoutStage(dugoutId: string, stage: DestructionStage): void {
+    const v = this.dugoutVisuals.get(dugoutId);
+    if (!v || v.stage >= stage) return;
+    v.stage = stage;
+
+    if (stage === 1) {
+      v.roof.rotation.z = 0.11;
+      v.roofBags.rotation.z = 0.11;
+      v.sign.rotation.z = -0.18;
+      v.lantern.color.setHex(0xff5533);
+    } else if (stage === 2) {
+      v.roof.position.y -= 0.72;
+      v.roof.rotation.x = 0.26;
+      v.roofBags.position.y -= 0.78;
+      v.lantern.intensity = 0;
+      v.bulb.visible = false;
+      v.sign.visible = false;
+      v.rubble.visible = true;
     }
   }
 

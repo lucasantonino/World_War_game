@@ -1,5 +1,13 @@
 import * as THREE from 'three';
-import { Crater, DugoutSpec, MissionConfig, RampSpec, TrenchSegment } from '../types';
+import {
+  Crater,
+  DestructionStage,
+  DugoutSpec,
+  MissionConfig,
+  RampSpec,
+  TrenchCollapse,
+  TrenchSegment
+} from '../types';
 import { getProceduralTextures } from '../engine/Textures';
 
 const WORLD_WIDTH = 110;
@@ -7,6 +15,7 @@ const WORLD_DEPTH = 120;
 const SEG_X = 110;
 const SEG_Z = 120;
 const MAX_CRATERS = 70;
+const MAX_TRENCH_COLLAPSES = 35;
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
@@ -45,6 +54,8 @@ export class Terrain {
   private trenches: TrenchSegment[] = [];
   private dugouts: DugoutSpec[] = [];
   private ramps: RampSpec[] = [];
+  private trenchCollapses: TrenchCollapse[] = [];
+  private dugoutStages = new Map<string, DestructionStage>();
   private normalsDirty = false;
 
   constructor() {
@@ -80,6 +91,11 @@ export class Terrain {
     this.craters.length = 0;
     for (const c of config.initialCraters) {
       this.craters.push({ ...c });
+    }
+    this.trenchCollapses = [];
+    this.dugoutStages.clear();
+    for (const d of config.dugouts) {
+      this.dugoutStages.set(d.id, 0);
     }
     this.rebuildAllVertices();
   }
@@ -117,10 +133,73 @@ export class Terrain {
         Math.abs(x - d.x) <= d.width * 0.48 &&
         Math.abs(z - d.z) <= d.depth * 0.48
       ) {
+        if ((this.dugoutStages.get(d.id) ?? 0) >= 2) {
+          return null;
+        }
         return d;
       }
     }
     return null;
+  }
+
+  public getDugoutStage(id: string): DestructionStage {
+    return this.dugoutStages.get(id) ?? 0;
+  }
+
+  public damageDugoutAt(
+    x: number,
+    z: number,
+    blastRadius: number
+  ): { dugout: DugoutSpec; newStage: DestructionStage } | null {
+    if (blastRadius < 5.5) return null;
+    for (const d of this.dugouts) {
+      const cur = this.dugoutStages.get(d.id) ?? 0;
+      if (cur >= 2) continue;
+      if (Math.hypot(x - d.x, z - d.z) <= Math.max(d.width, d.depth) * 0.75 + 2.2) {
+        const next = (cur + 1) as DestructionStage;
+        this.dugoutStages.set(d.id, next);
+        return { dugout: d, newStage: next };
+      }
+    }
+    return null;
+  }
+
+  public collapseTrenchAt(x: number, z: number, blastRadius: number): boolean {
+    if (this.getDugoutAt(x, z) !== null) return false;
+
+    const maxDist = blastRadius + 1.8;
+    const maxDistSq = maxDist * maxDist;
+    let nearTrench = false;
+    for (const tr of this.trenches) {
+      const seg = distToSegmentSq(x, z, tr.x1, tr.z1, tr.x2, tr.z2);
+      if (seg.distSq <= maxDistSq) {
+        nearTrench = true;
+        break;
+      }
+    }
+    if (!nearTrench) return false;
+
+    const radius = Math.min(4.0, Math.max(2.2, blastRadius * 0.7));
+    if (this.trenchCollapses.length >= MAX_TRENCH_COLLAPSES) {
+      this.trenchCollapses.shift();
+    }
+    this.trenchCollapses.push({ x, z, radius, depthLoss: 0.46 });
+
+    const rOuter = radius * 1.3;
+    this.updateLocalVertices(x, z, rOuter, (idx, dist, col) => {
+      const darken = 0.82 + 0.18 * smoothstep(0, rOuter, dist);
+      const prevR = col.getX(idx);
+      const prevG = col.getY(idx);
+      const prevB = col.getZ(idx);
+      col.setXYZ(
+        idx,
+        Math.max(0.28, prevR * darken),
+        Math.max(0.26, prevG * darken),
+        Math.max(0.24, prevB * darken)
+      );
+    });
+
+    return true;
   }
 
   public getTerrainHeight(x: number, z: number): number {
@@ -131,6 +210,7 @@ export class Terrain {
 
     // 1. Trenches
     let trenchOffset = 0;
+    let parapetOffset = 0;
     for (const tr of this.trenches) {
       const seg = distToSegmentSq(x, z, tr.x1, tr.z1, tr.x2, tr.z2);
       const dist = Math.sqrt(seg.distSq);
@@ -149,7 +229,7 @@ export class Terrain {
         if (matchSide) {
           const ridge =
             Math.sin(smoothstep(halfW + 0.35, halfW + 1.55, dist) * Math.PI) * 0.25;
-          y += ridge;
+          parapetOffset += ridge;
         }
       }
     }
@@ -165,7 +245,31 @@ export class Terrain {
       }
     }
 
-    y += trenchOffset;
+    const inDugout = this.getDugoutAt(x, z) !== null;
+
+    if (this.trenchCollapses.length > 0) {
+      let collapseLift = 0;
+      let collapseNorm = 0;
+      for (const tc of this.trenchCollapses) {
+        const dx = x - tc.x;
+        const dz = z - tc.z;
+        const dSq = dx * dx + dz * dz;
+        if (dSq < tc.radius * tc.radius) {
+          const d = Math.sqrt(dSq);
+          const factor = Math.cos((d / tc.radius) * Math.PI * 0.5);
+          collapseNorm = Math.max(collapseNorm, factor);
+          collapseLift = Math.max(collapseLift, tc.depthLoss * factor);
+        }
+      }
+      if (parapetOffset > 0 && collapseNorm > 0) {
+        parapetOffset *= 1 - collapseNorm * 0.75;
+      }
+      if (trenchOffset < -0.2 && collapseLift > 0 && !inDugout) {
+        trenchOffset += Math.min(-trenchOffset * 0.75, collapseLift);
+      }
+    }
+
+    y += parapetOffset + trenchOffset;
 
     // 3. Ramps smoothly bridge trench floor up to ground level
     for (const r of this.ramps) {
@@ -180,7 +284,6 @@ export class Terrain {
     }
 
     // 4. Craters (protected outside dugout interiors)
-    const inDugout = this.getDugoutAt(x, z) !== null;
     if (!inDugout) {
       for (const c of this.craters) {
         const dx = x - c.x;
@@ -213,10 +316,30 @@ export class Terrain {
     }
     this.craters.push(crater);
 
+    const rOuter = radius * 1.3;
+    this.updateLocalVertices(x, z, rOuter, (idx, dist, col) => {
+      const scorch = 1 - smoothstep(0, radius * 1.15, dist) * 0.55;
+      const prevR = col.getX(idx);
+      const prevG = col.getY(idx);
+      const prevB = col.getZ(idx);
+      col.setXYZ(
+        idx,
+        Math.min(prevR, 0.85 * scorch),
+        Math.min(prevG, 0.78 * scorch),
+        Math.min(prevB, 0.72 * scorch)
+      );
+    });
+  }
+
+  private updateLocalVertices(
+    x: number,
+    z: number,
+    rOuter: number,
+    shadeVertex: (idx: number, dist: number, col: THREE.BufferAttribute) => void
+  ): void {
     const pos = this.geometry.attributes.position as THREE.BufferAttribute;
     const col = this.geometry.attributes.color as THREE.BufferAttribute;
 
-    const rOuter = radius * 1.3;
     const minCol = Math.max(0, Math.floor((x - rOuter + WORLD_WIDTH * 0.5) / (WORLD_WIDTH / SEG_X)));
     const maxCol = Math.min(SEG_X, Math.ceil((x + rOuter + WORLD_WIDTH * 0.5) / (WORLD_WIDTH / SEG_X)));
     const minRow = Math.max(0, Math.floor((z - rOuter + WORLD_DEPTH * 0.5) / (WORLD_DEPTH / SEG_Z)));
@@ -230,18 +353,8 @@ export class Terrain {
         const vz = pos.getZ(idx);
         const dist = Math.hypot(vx - x, vz - z);
         if (dist <= rOuter) {
-          const newY = this.getTerrainHeight(vx, vz);
-          pos.setY(idx, newY);
-          const scorch = 1 - smoothstep(0, radius * 1.15, dist) * 0.55;
-          const prevR = col.getX(idx);
-          const prevG = col.getY(idx);
-          const prevB = col.getZ(idx);
-          col.setXYZ(
-            idx,
-            Math.min(prevR, 0.85 * scorch),
-            Math.min(prevG, 0.78 * scorch),
-            Math.min(prevB, 0.72 * scorch)
-          );
+          pos.setY(idx, this.getTerrainHeight(vx, vz));
+          shadeVertex(idx, dist, col);
         }
       }
     }

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CoverState, DestructibleSpec, RaycastHit } from '../types';
+import { CoverState, DestructibleSpec, DestructionStage, RaycastHit } from '../types';
 import { Terrain } from './Terrain';
 
 export interface SolidBoxCollider {
@@ -46,12 +46,27 @@ export interface CoverEvaluation {
 export class CoverSystem {
   private terrain: Terrain;
   private boxes: SolidBoxCollider[] = [];
-  private destructibles = new Map<string, DestructibleSpec & { mesh?: THREE.Object3D }>();
+  private destructibles = new Map<
+    string,
+    DestructibleSpec & {
+      mesh?: THREE.Object3D;
+      stage: DestructionStage;
+      onStageChange?: (stage: DestructionStage, spec: DestructibleSpec) => void;
+    }
+  >();
   private tankHulls: TankHullCollider[] = [];
   private wireHazards: WireHazard[] = [];
+  private onStageChangedGlobal: ((spec: DestructibleSpec, stage: DestructionStage) => void) | null =
+    null;
 
   constructor(terrain: Terrain) {
     this.terrain = terrain;
+  }
+
+  public setOnDestructibleStageChanged(
+    cb: (spec: DestructibleSpec, stage: DestructionStage) => void
+  ): void {
+    this.onStageChangedGlobal = cb;
   }
 
   public clear(): void {
@@ -65,8 +80,17 @@ export class CoverSystem {
     this.boxes.push(box);
   }
 
-  public registerDestructible(spec: DestructibleSpec, mesh: THREE.Object3D): void {
-    this.destructibles.set(spec.id, { ...spec, mesh });
+  public registerDestructible(
+    spec: DestructibleSpec,
+    mesh: THREE.Object3D,
+    onStageChange?: (stage: DestructionStage, spec: DestructibleSpec) => void
+  ): void {
+    this.destructibles.set(spec.id, {
+      ...spec,
+      mesh,
+      stage: spec.stage ?? 0,
+      onStageChange
+    });
     if (spec.blocksBullets || spec.blocksMovement || spec.blocksSight) {
       const rot = spec.rotationY ?? 0;
       const cos = Math.abs(Math.cos(rot));
@@ -104,21 +128,72 @@ export class CoverSystem {
     onDestroyed?: (spec: DestructibleSpec) => void
   ): boolean {
     const item = this.destructibles.get(id);
-    if (!item || item.hp <= 0) return false;
-    item.hp -= damage;
-    if (item.hp <= 0) {
-      item.hp = 0;
-      if (item.mesh) {
-        item.mesh.visible = false;
+    if (!item || item.stage >= 2) return false;
+
+    item.hp = Math.max(0, item.hp - damage);
+
+    if (item.hp > 0 && item.hp <= item.maxHp * 0.58 && item.stage === 0) {
+      item.stage = 1;
+      for (const box of this.boxes) {
+        if (box.destructibleId === id) {
+          box.maxY = box.minY + item.height * 0.62;
+        }
       }
-      this.boxes = this.boxes.filter((b) => b.destructibleId !== id);
-      for (const w of this.wireHazards) {
-        if (w.id === id) w.active = false;
+      item.onStageChange?.(1, item);
+      this.onStageChangedGlobal?.(item, 1);
+      return false;
+    }
+
+    if (item.hp <= 0 && item.stage < 2) {
+      item.stage = 2;
+      if (item.kind === 'sandbag' || item.kind === 'ruin' || item.kind === 'building') {
+        if (item.onStageChange) {
+          for (const box of this.boxes) {
+            if (box.destructibleId === id) {
+              box.maxY = box.minY + Math.max(0.22, item.height * 0.24);
+              box.blocksMovement = false;
+              box.blocksSight = false;
+              box.blocksBullets = true;
+            }
+          }
+          item.onStageChange(2, item);
+        } else {
+          if (item.mesh) {
+            item.mesh.visible = false;
+          }
+          this.boxes = this.boxes.filter((b) => b.destructibleId !== id);
+        }
+      } else {
+        this.boxes = this.boxes.filter((b) => b.destructibleId !== id);
+        for (const w of this.wireHazards) {
+          if (w.id === id) w.active = false;
+        }
+        if (item.onStageChange) {
+          item.onStageChange(2, item);
+        } else if (item.mesh) {
+          item.mesh.visible = false;
+        }
       }
+      this.onStageChangedGlobal?.(item, 2);
       onDestroyed?.(item);
       return true;
     }
+
     return false;
+  }
+
+  public crushByTank(tankPos: THREE.Vector3, crushRadius: number): void {
+    for (const [id, item] of this.destructibles.entries()) {
+      if (
+        item.stage < 2 &&
+        item.kind !== 'bunker_main' &&
+        item.kind !== 'bunker_mg' &&
+        Math.hypot(item.x - tankPos.x, item.z - tankPos.z) <=
+          crushRadius + Math.max(item.width, item.depth) * 0.35
+      ) {
+        this.damageDestructible(id, 9999);
+      }
+    }
   }
 
   public damageDestructiblesInRadius(
@@ -128,7 +203,7 @@ export class CoverSystem {
     onDestroyed?: (spec: DestructibleSpec) => void
   ): void {
     for (const [id, item] of this.destructibles.entries()) {
-      if (item.hp <= 0) continue;
+      if (item.stage >= 2 || item.hp <= 0) continue;
       if (item.kind === 'bunker_main') continue; // Main bunker requires direct charge or heavy bazooka hit
       const d = Math.hypot(item.x - center.x, item.z - center.z);
       if (d <= radius) {
