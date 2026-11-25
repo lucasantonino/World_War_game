@@ -19,7 +19,13 @@ import {
   MissionConfig,
   MissionEndSummary,
   MissionId,
-  PlayerCheckpointSnapshot
+  PlayerCheckpointSnapshot,
+  PlayerLoadout,
+  PrimaryWeaponId,
+  SecondaryWeaponId,
+  SoldierRole,
+  SurvivalRecord,
+  WeaponId
 } from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { EnvironmentBuilder } from '../world/EnvironmentBuilder';
@@ -31,6 +37,11 @@ import { InputManager } from './InputManager';
 
 const STORAGE_COMPLETED_KEY = 'tdn_completed_ops_v1';
 const STORAGE_SETTINGS_KEY = 'tdn_settings_v1';
+const STORAGE_UNLOCKS_KEY = 'tdn_unlocks_v1';
+const STORAGE_LOADOUT_KEY = 'tdn_loadout_v1';
+const STORAGE_SURVIVAL_KEY = 'tdn_survival_best_v1';
+
+const DEFAULT_UNLOCKED_WEAPONS: WeaponId[] = ['rifle', 'smg', 'pistol', 'bazooka', 'grenade'];
 
 const WAR_GRADE_VIGNETTE_SHADER = {
   uniforms: {
@@ -69,6 +80,13 @@ const WAR_GRADE_VIGNETTE_SHADER = {
   `
 };
 
+interface ArtillerySalvoShell {
+  x: number;
+  z: number;
+  delay: number;
+  whistled: boolean;
+}
+
 export class GameEngine {
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
@@ -103,7 +121,24 @@ export class GameEngine {
   private radioCaption: string | null = null;
   private radioCaptionTimer = 0;
   private airRaidAlert: string | null = null;
+  private airRaidAlertTimer = 0;
   private liveInteractables: InteractablePoint[] = [];
+  private dropMeshes = new Map<string, THREE.Object3D>();
+  private nextDropId = 1;
+
+  private artillerySalvoQueue: ArtillerySalvoShell[] = [];
+  private pendingStrafeWaves = 0;
+  private strafeCooldown = 999;
+  private troopCarTimer = 26;
+
+  private campAnchor = new THREE.Vector3();
+  private campTimer = 0;
+  private mortarZeroed = false;
+  private mortarZeroSalvoCooldown = 0;
+  private mortarWarningText: string | null = null;
+
+  private survivalWave = 1;
+  private survivalRecord: SurvivalRecord;
 
   private checkpointPhaseIndex = 0;
   private checkpointSnapshot: PlayerCheckpointSnapshot | null = null;
@@ -115,13 +150,21 @@ export class GameEngine {
 
   private settings: GameSettings;
   private completedMissions = new Set<MissionId>();
+  private unlockedWeapons = new Set<WeaponId>(DEFAULT_UNLOCKED_WEAPONS);
+  private loadout: PlayerLoadout;
+
   private clock = new THREE.Clock();
   private totalElapsed = 0;
   private wasInMission = false;
+  private tmpTankCamPos = new THREE.Vector3();
 
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
     this.settings = this.loadSettings();
     this.completedMissions = this.loadCompleted();
+    this.unlockedWeapons = this.loadUnlocks();
+    this.syncCompletedUnlocks();
+    this.loadout = this.loadLoadout();
+    this.survivalRecord = this.loadSurvivalRecord();
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -164,6 +207,9 @@ export class GameEngine {
       this.cover,
       this.projectiles
     );
+    this.player.onMeleeRequested = (origin, forward) => this.handlePlayerMelee(origin, forward);
+    this.player.onCallArtilleryRequested = (origin, dir) => this.handleArtilleryCall(origin, dir);
+
     this.soldiers = new SoldierSystem(
       this.scene,
       this.terrain,
@@ -172,6 +218,12 @@ export class GameEngine {
       this.vfx,
       this.audio
     );
+    this.soldiers.setOnSoldierKilled((pos, role, faction) => {
+      if (faction === 'enemy') {
+        this.maybeSpawnWeaponDrop(pos, role);
+      }
+    });
+
     this.tanks = new TankSystem(
       this.scene,
       this.terrain,
@@ -230,7 +282,7 @@ export class GameEngine {
         this.previewMenuScene(this.selectedMissionId);
       },
       onNextMission: () => {
-        const nextId = Math.min(3, this.selectedMissionId + 1) as MissionId;
+        const nextId = Math.min(5, this.selectedMissionId + 1) as MissionId;
         this.selectedMissionId = nextId;
         this.ui.setSelectedMission(nextId);
         this.screen = 'briefing';
@@ -242,6 +294,10 @@ export class GameEngine {
         this.renderer.shadowMap.enabled = this.settings.quality !== 'low';
         this.input.setTouchModeOverride(this.settings.touchControls);
         this.saveSettings();
+      },
+      onLoadoutChanged: (newLoadout) => {
+        this.loadout = { ...newLoadout };
+        this.saveLoadout();
       },
       onTouchMove: (x, y, sprinting) => {
         this.input.setTouchMove(x, y, sprinting);
@@ -269,12 +325,27 @@ export class GameEngine {
       },
       onTouchPause: () => {
         this.pauseGameplay();
+      },
+      onTouchMelee: () => {
+        this.player.triggerMelee((o, f) => this.handlePlayerMelee(o, f));
+      },
+      onTouchBinoculars: () => {
+        this.player.toggleBinoculars();
       }
     });
 
     this.ui.onTouchSmoke = () => {
       this.player.throwSmokeGrenade();
     };
+    this.ui.onTouchMelee = () => {
+      this.player.triggerMelee((o, f) => this.handlePlayerMelee(o, f));
+    };
+    this.ui.onTouchBinoculars = () => {
+      this.player.toggleBinoculars();
+    };
+
+    this.ui.setArsenalState(this.unlockedWeapons, this.loadout);
+    this.ui.setSurvivalRecord(this.survivalRecord);
 
     this.input.setOnPauseRequested(() => {
       this.pauseGameplay();
@@ -343,6 +414,16 @@ export class GameEngine {
       u.uSaturation.value = 0.82;
       u.uContrast.value = 1.09;
       u.uVignette.value = 0.28;
+    } else if (id === 4) {
+      (u.uTint.value as THREE.Vector3).set(1.04, 0.96, 0.88);
+      u.uSaturation.value = 0.86;
+      u.uContrast.value = 1.08;
+      u.uVignette.value = 0.27;
+    } else if (id === 5 || id === 99) {
+      (u.uTint.value as THREE.Vector3).set(1.02, 0.94, 0.92);
+      u.uSaturation.value = 0.79;
+      u.uContrast.value = 1.1;
+      u.uVignette.value = 0.3;
     } else {
       (u.uTint.value as THREE.Vector3).set(0.9, 0.96, 1.06);
       u.uSaturation.value = 0.8;
@@ -383,6 +464,34 @@ export class GameEngine {
     this.soldiers.clear();
     this.tanks.clear();
     this.bombers.clear();
+    for (const mesh of this.dropMeshes.values()) {
+      this.scene.remove(mesh);
+    }
+    this.dropMeshes.clear();
+    this.artillerySalvoQueue = [];
+    this.pendingStrafeWaves = 0;
+  }
+
+  private spawnAllyTankWithInteractable(x: number, z: number): void {
+    this.tanks.spawnAllyTank(x, z);
+    const existing = this.liveInteractables.find((i) => i.kind === 'ally_tank');
+    if (existing) {
+      existing.x = x;
+      existing.y = this.terrain.getTerrainHeight(x, z);
+      existing.z = z;
+      existing.active = true;
+    } else {
+      this.liveInteractables.push({
+        id: 'ally_tank_interact',
+        kind: 'ally_tank',
+        x,
+        y: this.terrain.getTerrainHeight(x, z),
+        z,
+        label: '[F] Embarcar no Tanque Aliado',
+        radius: 4.4,
+        active: true
+      });
+    }
   }
 
   private startMission(id: MissionId): void {
@@ -397,7 +506,12 @@ export class GameEngine {
     this.liveInteractables = cfg.interactables.map((i) => ({ ...i }));
 
     this.player.resetForMission(cfg.playerSpawn.x, cfg.playerSpawn.z, cfg.playerSpawn.yaw);
+    this.player.setLoadout(this.loadout);
     this.player.viewModel.root.visible = true;
+
+    if (cfg.allyTankSpawn) {
+      this.spawnAllyTankWithInteractable(cfg.allyTankSpawn.x, cfg.allyTankSpawn.z);
+    }
 
     this.soldiers.spawnAllies(cfg.allyCount);
     this.soldiers.spawnEmplacedGunners(cfg.enemyEmplacements);
@@ -406,7 +520,9 @@ export class GameEngine {
     this.missionElapsed = 0;
     this.kills = 0;
     this.tanksDestroyed = 0;
+    this.survivalWave = 1;
     this.airRaidAlert = null;
+    this.airRaidAlertTimer = 0;
     this.radioCaption = null;
     this.radioCaptionTimer = 0;
     this.checkpointPhaseIndex = 0;
@@ -416,6 +532,12 @@ export class GameEngine {
     this.checkpointKills = 0;
     this.checkpointTanks = 0;
     this.checkpointElapsed = 0;
+    this.campAnchor.copy(this.player.pos);
+    this.campTimer = 0;
+    this.mortarZeroed = false;
+    this.mortarZeroSalvoCooldown = 0;
+    this.mortarWarningText = null;
+    this.troopCarTimer = 26;
     this.wasInMission = true;
 
     this.beginPhase(0);
@@ -460,6 +582,10 @@ export class GameEngine {
     this.player.restoreFromCheckpoint(this.checkpointSnapshot, spawnX, spawnZ, spawnYaw);
     this.player.viewModel.root.visible = true;
 
+    if (cfg.allyTankSpawn) {
+      this.spawnAllyTankWithInteractable(cfg.allyTankSpawn.x, cfg.allyTankSpawn.z);
+    }
+
     for (const inter of this.liveInteractables) {
       if (inter.kind === 'radio') {
         inter.active = curPhase?.type === 'activate_radio';
@@ -475,10 +601,16 @@ export class GameEngine {
     this.tanksDestroyed = this.checkpointTanks;
     this.missionElapsed = this.checkpointElapsed;
     this.airRaidAlert = null;
+    this.airRaidAlertTimer = 0;
     this.radioCaption = null;
     this.radioCaptionTimer = 0;
     this.checkpointToast = null;
     this.checkpointToastTimer = 0;
+    this.campAnchor.copy(this.player.pos);
+    this.campTimer = 0;
+    this.mortarZeroed = false;
+    this.mortarWarningText = null;
+    this.troopCarTimer = 26;
     this.wasInMission = true;
 
     this.beginPhase(this.checkpointPhaseIndex, false);
@@ -504,6 +636,7 @@ export class GameEngine {
       saveCheckpoint &&
       idx >= 1 &&
       idx < this.activeMission.phases.length &&
+      !this.activeMission.isSurvival &&
       diffConfig.allowCheckpoints
     ) {
       this.checkpointPhaseIndex = idx;
@@ -517,6 +650,9 @@ export class GameEngine {
 
     this.phaseTimer = phase.durationSeconds ?? 0;
     this.artilleryCooldown = phase.artilleryRate ?? 999;
+    this.pendingStrafeWaves = phase.strafingWaves ?? 0;
+    this.strafeCooldown = this.pendingStrafeWaves > 0 ? 4.5 : 999;
+    this.troopCarTimer = 26;
 
     if (phase.radioOpening) {
       this.pushRadioCaption(phase.radioOpening);
@@ -534,9 +670,21 @@ export class GameEngine {
       }
     }
 
+    if (phase.spawnAllyTank && !this.tanks.hasLivingAllyTank()) {
+      this.spawnAllyTankWithInteractable(phase.spawnAllyTank.x, phase.spawnAllyTank.z);
+    }
+
     if (phase.tanksToSpawn) {
       for (const ts of phase.tanksToSpawn) {
         this.tanks.spawnTank(ts.x, ts.z, ts.heavy, ts.waypoints);
+      }
+    }
+
+    if (phase.troopCarsToSpawn) {
+      for (const spec of phase.troopCarsToSpawn) {
+        this.tanks.spawnTroopCar(spec, (x, z, count, roles) => {
+          this.soldiers.spawnSquadAt(x, z, count, roles);
+        });
       }
     }
 
@@ -548,6 +696,7 @@ export class GameEngine {
 
     if (phase.type === 'bomber_storm') {
       this.airRaidAlert = 'ALERTA AÉREO — ENTRE NO ABRIGO SUBTERRÂNEO!';
+      this.airRaidAlertTimer = 0;
       this.bombers.triggerBomberRun(() => {
         this.airRaidAlert = null;
         if (phase.enemiesToSpawn && phase.enemyRoles) {
@@ -566,6 +715,149 @@ export class GameEngine {
     this.radioCaption = text;
     this.radioCaptionTimer = 5.0;
     this.audio.playRadioStatic();
+  }
+
+  private maybeSpawnWeaponDrop(pos: THREE.Vector3, role: SoldierRole): void {
+    if (
+      role !== 'officer' &&
+      role !== 'mg_gunner' &&
+      role !== 'flamethrower' &&
+      role !== 'assault'
+    ) {
+      return;
+    }
+
+    let activeDrops = 0;
+    for (const inter of this.liveInteractables) {
+      if (inter.kind === 'weapon_drop' && inter.active) activeDrops++;
+    }
+    if (activeDrops >= 6) return;
+
+    const chance = role === 'assault' ? 0.16 : 0.28;
+    if (Math.random() > chance) return;
+
+    let weaponDropId: WeaponId = 'smg';
+    if (role === 'officer') {
+      weaponDropId = Math.random() < 0.55 ? 'sniper' : 'pistol';
+    } else if (role === 'mg_gunner') {
+      weaponDropId = 'lmg';
+    } else if (role === 'flamethrower') {
+      weaponDropId = 'shotgun';
+    } else {
+      weaponDropId = Math.random() < 0.45 ? 'shotgun' : 'smg';
+    }
+
+    const id = `drop_${this.nextDropId++}`;
+    const y = this.terrain.getTerrainHeight(pos.x, pos.z);
+    const inter: InteractablePoint = {
+      id,
+      kind: 'weapon_drop',
+      x: pos.x,
+      y,
+      z: pos.z,
+      label: `[F] Pegar ${WEAPON_STATS[weaponDropId].name}`,
+      radius: 2.4,
+      active: true,
+      weaponDropId
+    };
+    this.liveInteractables.push(inter);
+
+    const dropGroup = new THREE.Group();
+    const crate = new THREE.Mesh(
+      new THREE.BoxGeometry(0.46, 0.16, 0.24),
+      new THREE.MeshStandardMaterial({ color: 0x3b4032, roughness: 0.72, metalness: 0.25 })
+    );
+    crate.position.y = 0.08;
+    dropGroup.add(crate);
+
+    const gunBar = new THREE.Mesh(
+      new THREE.BoxGeometry(0.55, 0.06, 0.08),
+      new THREE.MeshStandardMaterial({ color: 0x222524, roughness: 0.45, metalness: 0.7 })
+    );
+    gunBar.position.y = 0.2;
+    gunBar.rotation.y = Math.random() * Math.PI;
+    dropGroup.add(gunBar);
+
+    const marker = new THREE.Mesh(
+      new THREE.RingGeometry(0.28, 0.36, 16),
+      new THREE.MeshBasicMaterial({
+        color: 0xe6b450,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.75
+      })
+    );
+    marker.rotation.x = -Math.PI * 0.5;
+    marker.position.y = 0.03;
+    dropGroup.add(marker);
+
+    dropGroup.position.set(pos.x, y, pos.z);
+    this.scene.add(dropGroup);
+    this.dropMeshes.set(id, dropGroup);
+  }
+
+  private handlePlayerMelee(origin: THREE.Vector3, forward: THREE.Vector3): void {
+    const res = this.soldiers.checkMeleeHit(origin, forward, 2.5);
+    if (res.hit) {
+      this.player.registerHitMarker(res.killed);
+      if (res.killed) {
+        this.kills++;
+      }
+      if (res.pos) {
+        this.soldiers.suppressInRadius(res.pos.x, res.pos.z, 4.0, 1.8);
+      }
+    }
+  }
+
+  private handleArtilleryCall(origin: THREE.Vector3, dir: THREE.Vector3): void {
+    const hit = this.cover.raycastWorld(origin, dir, 130, true);
+    let tx: number;
+    let tz: number;
+    if (hit) {
+      tx = hit.point.x;
+      tz = hit.point.z;
+    } else {
+      tx = THREE.MathUtils.clamp(origin.x + dir.x * 65, -42, 42);
+      tz = THREE.MathUtils.clamp(origin.z + dir.z * 65, -42, 42);
+    }
+
+    this.pushRadioCaption('ARTILHARIA ALIADA CONFIRMADA! SALVA DE OBUSES A CAMINHO (2.6s)!');
+    for (let i = 0; i < 4; i++) {
+      this.artillerySalvoQueue.push({
+        x: THREE.MathUtils.clamp(tx + (Math.random() - 0.5) * 8.5, -42, 42),
+        z: THREE.MathUtils.clamp(tz + (Math.random() - 0.5) * 8.5, -42, 42),
+        delay: 2.6 + i * 0.42,
+        whistled: false
+      });
+    }
+  }
+
+  private triggerStrafeWave(diffConfig: ReturnType<typeof getDifficultyConfig>): void {
+    const tx = THREE.MathUtils.clamp(this.player.pos.x + (Math.random() - 0.5) * 10, -34, 34);
+    const tz = THREE.MathUtils.clamp(this.player.pos.z + (Math.random() - 0.5) * 8, -32, 34);
+    this.audio.playStrafeSiren();
+    this.airRaidAlert = 'CAÇA RASANTE INIMIGO — ABAIXE-SE NA VALA!';
+    this.airRaidAlertTimer = 5.4;
+
+    this.bombers.triggerStrafingRun(tx, tz, (impactPos) => {
+      this.vfx.spawnBulletImpact(impactPos, new THREE.Vector3(0, 1, 0), false);
+      const dist = impactPos.distanceTo(this.player.pos);
+      if (this.player.inAllyTank) {
+        if (dist < 4.0) {
+          this.tanks.applyDamageToAllyTank(14);
+        }
+      } else if (dist < 3.4 && this.player.coverState !== 'dugout' && !this.player.overheadProtected) {
+        const insideBuilding = this.cover.isInsideEnterableBuilding(this.player.pos.x, this.player.pos.z);
+        if (!insideBuilding) {
+          const coverMult = this.player.coverState === 'sheltered' && this.player.isCrouching ? 0.3 : 1.0;
+          const dmg = 26 * coverMult;
+          if (dmg > 4) {
+            this.player.applyDamage(dmg, impactPos, 'Metralhamento de caça rasante', dmg > 18, diffConfig);
+          }
+        }
+      }
+      this.soldiers.applyBlastDamage(impactPos, 2.4, 42, false);
+    });
   }
 
   private handleExplosion(
@@ -603,6 +895,7 @@ export class GameEngine {
         } else {
           this.pushRadioCaption(`${label} DESTRUÍDO! MUDE PARA OUTRO ABRIGO!`);
           const inThisDugout =
+            !this.player.inAllyTank &&
             Math.abs(this.player.pos.x - dugHit.dugout.x) <= dugHit.dugout.width * 0.56 &&
             Math.abs(this.player.pos.z - dugHit.dugout.z) <= dugHit.dugout.depth * 0.56;
           if (inThisDugout) {
@@ -624,33 +917,47 @@ export class GameEngine {
     const pan = Math.max(-1, Math.min(1, (center.x - this.player.pos.x) / 28));
     this.audio.playExplosion(distToPlayer, Math.max(0.8, radius / 6.5), pan);
 
-    // Damage enemies & tanks
+    // Damage & suppress enemies & tanks
+    this.soldiers.suppressInRadius(center.x, center.z, Math.max(5.5, radius * 1.15), 2.5);
     this.soldiers.applyBlastDamage(center, radius, maxDamage, isFromPlayer, () => {
       if (isFromPlayer) this.kills++;
     });
-    this.tanks.applyBlastDamage(center, radius * 0.8, maxDamage * 0.85, () => {
+    this.tanks.applyBlastDamage(center, radius * 0.85, maxDamage * 0.9, () => {
       this.tanksDestroyed++;
       this.pushRadioCaption('ALVO BLINDADO DESTRUÍDO! BOM TIRO!');
     });
+
+    // Ally tank blast damage
+    if (!isFromPlayer && this.tanks.hasLivingAllyTank()) {
+      const allyPos = this.tanks.getAllyTankPosition();
+      if (allyPos) {
+        const dAlly = allyPos.distanceTo(center);
+        if (dAlly <= radius + 1.5) {
+          const dmg = maxDamage * 0.55 * (1 - Math.min(0.8, dAlly / (radius + 2)));
+          this.tanks.applyDamageToAllyTank(dmg);
+        }
+      }
+    }
 
     // Player blast, suppression, tinnitus & screen shake
     if (distToPlayer < 26) {
       const prox = 1 - distToPlayer / 26;
       this.player.addShake(prox * 0.85);
-      this.player.applySuppression(prox * 0.7);
-      if (distToPlayer < 13) {
+      this.player.applySuppression(prox * (this.player.inAllyTank ? 0.25 : 0.7));
+      if (distToPlayer < 13 && !this.player.inAllyTank) {
         this.player.tinnitus = Math.min(1, this.player.tinnitus + (1 - distToPlayer / 13) * 0.95);
       }
     }
 
-    if (distToPlayer <= radius) {
-      // Dugout overhead shelter protects from aerial bombs & distant artillery!
-      const isAerialOrArtillery = cause.includes('aérea') || cause.includes('Artilharia');
-      if (isAerialOrArtillery && this.player.overheadProtected) {
+    if (distToPlayer <= radius && !this.player.inAllyTank) {
+      // Dugout / building overhead shelter protects from aerial bombs & distant artillery!
+      const isAerialOrArtillery = cause.includes('aérea') || cause.includes('Artilharia') || cause.includes('Morteiro');
+      const insideBuilding = this.cover.isInsideEnterableBuilding(this.player.pos.x, this.player.pos.z);
+      if (isAerialOrArtillery && (this.player.overheadProtected || insideBuilding)) {
         return;
       }
       const coverReduction =
-        this.player.coverState === 'dugout'
+        this.player.coverState === 'dugout' || insideBuilding
           ? 0.2
           : this.player.coverState === 'sheltered' && !cause.includes('Granada')
             ? 0.35
@@ -668,22 +975,32 @@ export class GameEngine {
     this.wasInMission = false;
     this.input.setGameplayActive(false);
 
-    if (victory) {
+    const isSurvival = Boolean(this.activeMission.isSurvival || this.activeMission.id === 99);
+    if (isSurvival) {
+      this.updateAndSaveSurvivalRecord();
+    }
+
+    if (victory && !isSurvival) {
       this.completedMissions.add(this.activeMission.id);
       this.saveCompleted();
+      this.syncCompletedUnlocks();
+      this.saveUnlocks();
       this.ui.setCompletedMissions(this.completedMissions);
+      this.ui.setArsenalState(this.unlockedWeapons, this.loadout);
       this.screen = 'victory';
     } else {
-      this.screen = 'kia';
+      this.screen = victory ? 'victory' : 'kia';
     }
 
     let advice = 'Mantenha-se abaixo do parapeito com [C] e avance apenas quando houver pausa no fogo.';
-    if (this.player.lastDamageCause.includes('aérea')) {
-      advice = 'Quando ouvir a sirene aérea, corra imediatamente para um dos ABRIGOS subterrâneos na parede traseira.';
+    if (this.player.lastDamageCause.includes('aérea') || this.player.lastDamageCause.includes('caça')) {
+      advice = 'Quando ouvir a sirene aérea, corra imediatamente para um dos ABRIGOS subterrâneos ou edificações fechadas.';
+    } else if (this.player.lastDamageCause.includes('Morteiro')) {
+      advice = 'Não permaneça parado no mesmo ponto fora de abrigos! Mude de cratera assim que o morteiro começar a calibrar.';
     } else if (this.player.lastDamageCause.includes('Hemorragia')) {
       advice = 'Ao receber tiro grave, recue para a cobertura e segure [H] por 2 segundos para aplicar curativo.';
     } else if (this.player.lastDamageCause.includes('tanque')) {
-      advice = 'Nunca encare a frente de um tanque em campo aberto. Flanqueie pelas crateras usando a Bazuca [3].';
+      advice = 'Nunca encare a frente de um tanque em campo aberto. Flanqueie pelas crateras usando a Bazuca [3] ou Artilharia [B].';
     } else if (this.player.lastDamageCause.includes('Granada')) {
       advice = 'Fique atento ao aviso de granada próxima — afaste-se ou pressione [F] bem perto dela para chutá-la de volta.';
     }
@@ -691,6 +1008,7 @@ export class GameEngine {
     const diffConfig = getDifficultyConfig(this.settings.difficulty);
     const canRetryCheckpoint =
       !victory &&
+      !isSurvival &&
       diffConfig.allowCheckpoints &&
       this.checkpointSnapshot !== null &&
       this.checkpointPhaseIndex >= 1;
@@ -700,7 +1018,9 @@ export class GameEngine {
 
     const summary: MissionEndSummary = {
       missionId: this.activeMission.id,
-      missionTitle: `${this.activeMission.code} — ${this.activeMission.title}`,
+      missionTitle: isSurvival
+        ? `${this.activeMission.code} — Vaga ${this.survivalWave}`
+        : `${this.activeMission.code} — ${this.activeMission.title}`,
       victory,
       causeOfDeath: this.player.lastDamageCause,
       tacticalAdvice: advice,
@@ -719,6 +1039,7 @@ export class GameEngine {
   private updateGameplay(dt: number): void {
     this.missionElapsed += dt;
     const diffConfig = getDifficultyConfig(this.settings.difficulty);
+    const isSurvival = Boolean(this.activeMission.isSurvival || this.activeMission.id === 99);
 
     if (this.radioCaptionTimer > 0) {
       this.radioCaptionTimer -= dt;
@@ -729,6 +1050,31 @@ export class GameEngine {
       this.checkpointToastTimer -= dt;
       if (this.checkpointToastTimer <= 0) this.checkpointToast = null;
     }
+
+    if (this.airRaidAlertTimer > 0) {
+      this.airRaidAlertTimer -= dt;
+      if (this.airRaidAlertTimer <= 0 && !this.bombers.isActive()) {
+        this.airRaidAlert = null;
+      }
+    }
+
+    // Sync ally tank interactable position
+    const allyTankPos = this.tanks.getAllyTankPosition();
+    const allyTankStatus = this.tanks.getAllyTankStatus();
+    for (const inter of this.liveInteractables) {
+      if (inter.kind === 'ally_tank') {
+        if (allyTankPos && allyTankStatus.alive) {
+          inter.x = allyTankPos.x;
+          inter.y = allyTankPos.y;
+          inter.z = allyTankPos.z;
+          inter.active = !this.player.inAllyTank;
+        } else {
+          inter.active = false;
+        }
+      }
+    }
+
+    const prevShotsFired = this.player.shotsFired;
 
     // Player update
     const playerInteraction = this.player.update(
@@ -750,11 +1096,86 @@ export class GameEngine {
           if (this.activeMission.phases[this.phaseIndex]?.type === 'plant_charge') {
             this.beginPhase(this.phaseIndex + 1);
           }
+        } else if (kind === 'weapon_drop') {
+          const dropInter = this.liveInteractables.find((i) => i.id === id);
+          if (dropInter && dropInter.weaponDropId) {
+            dropInter.active = false;
+            const mesh = this.dropMeshes.get(id);
+            if (mesh) {
+              this.scene.remove(mesh);
+              this.dropMeshes.delete(id);
+            }
+            const msg = this.player.equipDroppedWeapon(dropInter.weaponDropId);
+            this.unlockWeapon(dropInter.weaponDropId);
+            this.pushRadioCaption(msg);
+          }
+        } else if (kind === 'ally_tank') {
+          if (id === 'exit_ally_tank' || this.player.inAllyTank) {
+            const tp = this.tanks.getAllyTankPosition();
+            const safePos = tp
+              ? new THREE.Vector3(
+                  THREE.MathUtils.clamp(tp.x + 2.8, -38, 38),
+                  tp.y,
+                  THREE.MathUtils.clamp(tp.z + 1.5, -38, 38)
+                )
+              : undefined;
+            this.player.exitAllyTank(safePos);
+          } else if (allyTankStatus.alive) {
+            this.player.enterAllyTank();
+            this.pushRadioCaption('Tanque aliado sob seu controle! Avance e abra fogo!');
+          }
         }
       },
       diffConfig,
       (origin, dir) => this.soldiers.findAutoAimTarget(origin, dir)
     );
+
+    // Update player-controlled ally tank
+    if (this.player.inAllyTank) {
+      if (!allyTankStatus.alive) {
+        this.player.exitAllyTank();
+        this.player.applyDamage(
+          45,
+          this.player.pos,
+          'Blindado aliado destruído em combate',
+          true,
+          diffConfig
+        );
+      } else {
+        const ctrl = this.player.getTankControlInput();
+        this.tanks.updatePlayerControlledAllyTank(
+          dt,
+          ctrl.throttle,
+          ctrl.steer,
+          ctrl.aimYaw,
+          ctrl.aimPitch,
+          ctrl.fireCannon,
+          ctrl.fireCoax,
+          this.tmpTankCamPos,
+          (origin, dir) => {
+            this.projectiles.spawnRocket(origin, dir, 'ally');
+            this.audio.playTankCannonShot();
+            this.player.addShake(0.45);
+            this.player.shotsFired++;
+          },
+          (origin, dir) => {
+            this.projectiles.spawnBullet(origin, dir, 152, 26, 'ally');
+            this.audio.playGunshot('mg', 0, 0);
+            this.player.shotsFired++;
+          }
+        );
+        this.player.syncAllyTankCamera(this.tmpTankCamPos, this.tanks.getAllyTankPosition());
+      }
+    }
+
+    // Suppress enemies near player gunfire impacts
+    if (this.player.shotsFired > prevShotsFired) {
+      const camDir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+      const impact = this.cover.raycastWorld(this.camera.position, camDir, 75, true);
+      if (impact) {
+        this.soldiers.suppressInRadius(impact.point.x, impact.point.z, 5.5, 2.4);
+      }
+    }
 
     // Update entities
     this.soldiers.update(
@@ -782,6 +1203,30 @@ export class GameEngine {
 
     this.bombers.update(dt, this.player.pos.x);
 
+    // Delayed allied artillery salvos from [B] binoculars
+    for (let i = this.artillerySalvoQueue.length - 1; i >= 0; i--) {
+      const shell = this.artillerySalvoQueue[i];
+      shell.delay -= dt;
+      if (shell.delay <= 1.0 && !shell.whistled) {
+        shell.whistled = true;
+        const pan = Math.max(-1, Math.min(1, (shell.x - this.player.pos.x) / 22));
+        this.audio.playBombWhistle(pan);
+      }
+      if (shell.delay <= 0) {
+        const y = this.terrain.getTerrainHeight(shell.x, shell.z);
+        this.handleExplosion(
+          new THREE.Vector3(shell.x, y, shell.z),
+          9.5,
+          165,
+          3.2,
+          1.15,
+          'Barragem de Artilharia Aliada',
+          true
+        );
+        this.artillerySalvoQueue.splice(i, 1);
+      }
+    }
+
     this.projectiles.update(
       dt,
       this.player.pos,
@@ -793,6 +1238,7 @@ export class GameEngine {
           });
           if (res.hit && isPlayerShot) {
             this.player.registerHitMarker(res.headshot);
+            this.soldiers.suppressInRadius(pos.x, pos.z, 5.5, 2.4);
           }
           return res.hit;
         },
@@ -800,18 +1246,34 @@ export class GameEngine {
           return this.soldiers.checkBulletHit('ally', pos, dir, damage).hit;
         },
         onHitPlayer: (damage, origin, cause, causeBleed) => {
-          this.player.applyDamage(damage, origin, cause, causeBleed, diffConfig);
+          if (this.player.inAllyTank) {
+            this.tanks.applyDamageToAllyTank(damage * 0.45);
+          } else {
+            this.player.applyDamage(damage, origin, cause, causeBleed, diffConfig);
+          }
         },
         onNearMissPlayer: (origin) => {
+          if (this.player.inAllyTank) return;
           const pan = Math.max(-1, Math.min(1, (origin.x - this.player.pos.x) / 14));
           this.audio.playBulletWhiz(pan);
           this.player.applySuppression(0.24);
         },
-        onHitTank: (pos, _damage, isRocket) => {
-          const hit = this.tanks.checkProjectileHit(pos, isRocket, () => {
-            this.tanksDestroyed++;
-            this.pushRadioCaption('TANQUE INIMIGO ABATIDO!');
-          });
+        onHitTank: (pos, damage, isRocket) => {
+          const bulletDmg =
+            damage > 0
+              ? damage
+              : this.player.inAllyTank
+                ? 26
+                : WEAPON_STATS[this.player.weaponId].damage;
+          const hit = this.tanks.checkProjectileHit(
+            pos,
+            isRocket,
+            () => {
+              this.tanksDestroyed++;
+              this.pushRadioCaption('VEÍCULO INIMIGO DESTRUÍDO! BOM TIRO!');
+            },
+            bulletDmg
+          );
           if (hit && isRocket) {
             this.player.registerHitMarker(true);
           }
@@ -841,18 +1303,99 @@ export class GameEngine {
       true
     );
 
-    // Phase progression & ambient artillery
+    // Phase progression, strafing runs, troop car reinforcements, mortar zeroing & Survival waves
     const phase = this.activeMission.phases[this.phaseIndex];
     if (phase) {
       if (phase.artilleryRate && phase.artilleryRate < 100) {
         this.artilleryCooldown -= dt;
         if (this.artilleryCooldown <= 0) {
           this.artilleryCooldown = phase.artilleryRate * (0.75 + Math.random() * 0.5);
-          const ax = this.player.pos.x + (Math.random() - 0.5) * 26;
-          const az = Math.max(-24, Math.min(34, this.player.pos.z - 6 + (Math.random() - 0.5) * 18));
+          const spreadX = this.mortarZeroed ? 5.5 : 26;
+          const spreadZ = this.mortarZeroed ? 5.5 : 18;
+          const ax = this.player.pos.x + (Math.random() - 0.5) * spreadX;
+          const az = Math.max(
+            -24,
+            Math.min(34, this.player.pos.z + (this.mortarZeroed ? 0 : -6) + (Math.random() - 0.5) * spreadZ)
+          );
           this.projectiles.spawnFallingBomb(ax, 28, az, false);
           this.audio.playBombWhistle(Math.max(-1, Math.min(1, (ax - this.player.pos.x) / 20)));
         }
+      }
+
+      // Strafing runs
+      if (this.pendingStrafeWaves > 0) {
+        this.strafeCooldown -= dt;
+        if (this.strafeCooldown <= 0) {
+          this.pendingStrafeWaves--;
+          this.strafeCooldown = 16;
+          this.triggerStrafeWave(diffConfig);
+        }
+      }
+
+      // Periodic troop car reinforcements in long phases
+      if (
+        (phase.type === 'survive_wave' || phase.type === 'clear_trench' || phase.type === 'tank_assault') &&
+        this.soldiers.getRemainingWaveCount() > 18
+      ) {
+        this.troopCarTimer -= dt;
+        if (this.troopCarTimer <= 0) {
+          this.troopCarTimer = 28;
+          const sx = (Math.random() - 0.5) * 32;
+          this.tanks.spawnTroopCar(
+            {
+              x: sx,
+              z: -45,
+              dropX: sx * 0.65,
+              dropZ: -16 + Math.random() * 8,
+              passengers: 5,
+              roles: ['assault', 'rifleman', 'grenadier']
+            },
+            (x, z, count, roles) => this.soldiers.spawnSquadAt(x, z, count, roles)
+          );
+        }
+      }
+
+      // Mortar zeroing anti-camping
+      if (phase.mortarZeroing || isSurvival) {
+        const insideBuilding = this.cover.isInsideEnterableBuilding(this.player.pos.x, this.player.pos.z);
+        const safeFromZeroing =
+          this.player.coverState === 'dugout' ||
+          this.player.overheadProtected ||
+          insideBuilding ||
+          this.player.inAllyTank;
+
+        const distMoved = Math.hypot(
+          this.player.pos.x - this.campAnchor.x,
+          this.player.pos.z - this.campAnchor.z
+        );
+
+        if (safeFromZeroing || distMoved > 5.0) {
+          this.campAnchor.copy(this.player.pos);
+          this.campTimer = 0;
+          this.mortarZeroed = false;
+          this.mortarZeroSalvoCooldown = 0;
+          this.mortarWarningText = null;
+        } else if (distMoved < 3.8) {
+          this.campTimer += dt;
+          if (this.campTimer > 9.0) {
+            this.mortarZeroed = true;
+            this.mortarWarningText = 'MORTEIRO CALIBRADO! SAIA DA POSIÇÃO IMEDIATAMENTE!';
+            this.mortarZeroSalvoCooldown -= dt;
+            if (this.mortarZeroSalvoCooldown <= 0) {
+              this.mortarZeroSalvoCooldown = 3.1;
+              const mx = this.player.pos.x + (Math.random() - 0.5) * 3.0;
+              const mz = this.player.pos.z + (Math.random() - 0.5) * 3.0;
+              this.projectiles.spawnFallingBomb(mx, 28, mz, false);
+              this.audio.playBombWhistle(0);
+            }
+          } else if (this.campTimer > 6.5) {
+            this.mortarWarningText = 'MORTEIRO INIMIGO CALIBRANDO SUA POSIÇÃO — MOVA-SE!';
+          }
+        }
+      } else {
+        this.campTimer = 0;
+        this.mortarZeroed = false;
+        this.mortarWarningText = null;
       }
 
       let advance = false;
@@ -860,7 +1403,7 @@ export class GameEngine {
         if (this.soldiers.getRemainingWaveCount() === 0) {
           advance = true;
         }
-      } else if (phase.type === 'destroy_tanks') {
+      } else if (phase.type === 'destroy_tanks' || phase.type === 'tank_assault') {
         if (
           this.tanks.getLivingTankCount() === 0 &&
           this.soldiers.getRemainingWaveCount() <= 2
@@ -894,10 +1437,18 @@ export class GameEngine {
       } else if (phase.type === 'detonate_wait') {
         this.phaseTimer -= dt;
         if (this.phaseTimer <= 0) {
-          const bunkerPos = new THREE.Vector3(0, 0, -36);
+          const mainBunker = this.activeMission.bunkers.find((b) => b.kind === 'bunker_main');
+          const bunkerPos = new THREE.Vector3(mainBunker?.x ?? 0, 0, mainBunker?.z ?? -36);
           this.envBuilder.shatterMainBunker();
           this.handleExplosion(bunkerPos, 15, 220, 4.5, 1.5, 'Detonação do Bunker Principal', true);
           advance = true;
+        }
+      } else if (phase.type === 'survival_endless') {
+        if (
+          this.soldiers.getRemainingWaveCount() === 0 &&
+          this.tanks.getLivingTankCount() === 0
+        ) {
+          this.advanceSurvivalWave(diffConfig);
         }
       }
 
@@ -916,18 +1467,82 @@ export class GameEngine {
     this.emitHUDState(playerInteraction);
   }
 
+  private advanceSurvivalWave(diffConfig: ReturnType<typeof getDifficultyConfig>): void {
+    this.survivalWave++;
+    this.updateAndSaveSurvivalRecord();
+    this.pushRadioCaption(`VAGA ${this.survivalWave} INICIADA! REFORÇOS INIMIGOS NA TERRA DE NINGUÉM!`);
+
+    // Small breather supply bonus every 2 waves
+    if (this.survivalWave % 2 === 1) {
+      this.player.bandages = Math.min(5, this.player.bandages + 1);
+      this.player.smokeGrenades = Math.min(4, this.player.smokeGrenades + 1);
+    }
+
+    const maxSimultaneous = getMaxSimultaneousEnemies(
+      this.settings.difficulty,
+      this.settings.quality,
+      this.isMobileDevice()
+    );
+
+    const enemyCount = Math.min(
+      260,
+      Math.round((22 + this.survivalWave * 9) * diffConfig.waveCountMult)
+    );
+    const roles: SoldierRole[] = ['rifleman', 'assault', 'grenadier'];
+    if (this.survivalWave >= 2) roles.push('mg_gunner', 'officer');
+    if (this.survivalWave >= 3) roles.push('flamethrower');
+
+    this.soldiers.queueEnemyWave(enemyCount, roles, maxSimultaneous);
+
+    // Spawn troop car on waves >= 2
+    const sx = (Math.random() - 0.5) * 30;
+    this.tanks.spawnTroopCar(
+      {
+        x: sx,
+        z: -45,
+        dropX: sx * 0.6,
+        dropZ: -14 + Math.random() * 6,
+        passengers: Math.min(7, 4 + Math.floor(this.survivalWave / 2)),
+        roles: ['assault', 'grenadier', 'flamethrower']
+      },
+      (x, z, count, r) => this.soldiers.spawnSquadAt(x, z, count, r)
+    );
+
+    // Enemy tanks every 2 waves
+    if (this.survivalWave % 2 === 0) {
+      const tankCount = this.survivalWave >= 6 ? 2 : 1;
+      for (let i = 0; i < tankCount; i++) {
+        const tx = (i === 0 ? -1 : 1) * (10 + Math.random() * 8);
+        this.tanks.spawnTank(tx, -38, this.survivalWave >= 4, [
+          { x: tx * 0.7, z: -12 },
+          { x: tx * 0.4, z: 10 },
+          { x: 0, z: 22 }
+        ]);
+      }
+    }
+
+    // Air strike / strafing every 3 waves
+    if (this.survivalWave % 3 === 0) {
+      this.triggerStrafeWave(diffConfig);
+    }
+  }
+
   private emitHUDState(playerInteraction: {
     interactPrompt: string | null;
     actionProgress: number;
     actionLabel: string | null;
   }): void {
     const phase = this.activeMission.phases[this.phaseIndex];
+    const isSurvival = Boolean(this.activeMission.isSurvival || this.activeMission.id === 99);
     let objectiveBearing: number | null = null;
     let objectiveDistance: number | null = null;
     let objText = phase?.objectiveText ?? '';
     let objSub = phase?.objectiveSubtext ?? '';
 
-    if (phase?.type === 'hold_timer' || phase?.type === 'detonate_wait') {
+    if (isSurvival) {
+      objText = `SOBREVIVA À VAGA ${this.survivalWave}`;
+      objSub = `Elimine todas as forças inimigas • Abates: ${this.kills}`;
+    } else if (phase?.type === 'hold_timer' || phase?.type === 'detonate_wait') {
       objSub = `${objSub} (${Math.max(0, Math.ceil(this.phaseTimer))}s)`;
     }
 
@@ -935,7 +1550,6 @@ export class GameEngine {
       const dx = phase.objectiveTarget.x - this.player.pos.x;
       const dz = phase.objectiveTarget.z - this.player.pos.z;
       objectiveDistance = Math.hypot(dx, dz);
-      // Bearing 0 = North (-Z), PI/2 = East (+X)
       objectiveBearing = Math.atan2(dx, -dz);
       if (objectiveBearing < 0) objectiveBearing += Math.PI * 2;
     }
@@ -951,6 +1565,7 @@ export class GameEngine {
       !playerInteraction.interactPrompt &&
       !touchActive &&
       !inSmokeScreen &&
+      !this.player.inAllyTank &&
       this.player.smokeGrenades > 0 &&
       this.missionElapsed < 35 &&
       (this.player.coverState === 'exposed' || this.player.peekDanger > 0.65)
@@ -962,6 +1577,7 @@ export class GameEngine {
       (THREE.MathUtils.lerp(stats.spreadHip, stats.spreadAds, this.player.adsFactor) +
         this.player.suppression * 0.035) *
       460;
+    const allyTankStatus = this.tanks.getAllyTankStatus();
 
     const hud: HUDState = {
       hp: this.player.hp,
@@ -1020,7 +1636,21 @@ export class GameEngine {
       remainingWaveEnemies: this.soldiers.getRemainingWaveCount(),
       touchActive,
       smokeGrenades: this.player.smokeGrenades,
-      inSmokeScreen
+      inSmokeScreen,
+      primaryWeaponId: this.player.primaryWeapon,
+      secondaryWeaponId: this.player.secondaryWeapon,
+      binocularsActive: this.player.binocularsActive,
+      artilleryCallCooldown: this.player.artilleryCallCooldown,
+      artilleryCallReady: this.player.artilleryCallCooldown <= 0,
+      meleeCooldown: this.player.meleeCooldown,
+      sniperScopeActive: this.player.sniperScopeActive,
+      inAllyTank: this.player.inAllyTank,
+      allyTankHp: allyTankStatus.hp,
+      allyTankMaxHp: allyTankStatus.maxHp,
+      allyTankShellCooldown: allyTankStatus.shellCooldown,
+      mortarWarning: this.mortarWarningText,
+      survivalWave: this.survivalWave,
+      isSurvival
     };
 
     this.ui.updateHUD(hud);
@@ -1051,6 +1681,26 @@ export class GameEngine {
     }
   };
 
+  private syncCompletedUnlocks(): void {
+    if (this.completedMissions.has(0)) {
+      this.unlockedWeapons.add('shotgun');
+    }
+    if (this.completedMissions.has(1)) {
+      this.unlockedWeapons.add('sniper');
+    }
+    if (this.completedMissions.has(2)) {
+      this.unlockedWeapons.add('lmg');
+    }
+  }
+
+  private unlockWeapon(id: WeaponId): void {
+    if (!this.unlockedWeapons.has(id)) {
+      this.unlockedWeapons.add(id);
+      this.saveUnlocks();
+      this.ui.setArsenalState(this.unlockedWeapons, this.loadout);
+    }
+  }
+
   private loadCompleted(): Set<MissionId> {
     try {
       const raw = localStorage.getItem(STORAGE_COMPLETED_KEY);
@@ -1067,6 +1717,105 @@ export class GameEngine {
       localStorage.setItem(STORAGE_COMPLETED_KEY, JSON.stringify([...this.completedMissions]));
     } catch {
       // Ignore storage errors
+    }
+  }
+
+  private loadUnlocks(): Set<WeaponId> {
+    const base = new Set<WeaponId>(DEFAULT_UNLOCKED_WEAPONS);
+    try {
+      const raw = localStorage.getItem(STORAGE_UNLOCKS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as WeaponId[];
+        if (Array.isArray(parsed)) {
+          for (const w of parsed) {
+            if (w in WEAPON_STATS) base.add(w);
+          }
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return base;
+  }
+
+  private saveUnlocks(): void {
+    try {
+      localStorage.setItem(STORAGE_UNLOCKS_KEY, JSON.stringify([...this.unlockedWeapons]));
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  private loadLoadout(): PlayerLoadout {
+    const defaults: PlayerLoadout = { primary: 'rifle', secondary: 'pistol' };
+    try {
+      const raw = localStorage.getItem(STORAGE_LOADOUT_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<PlayerLoadout>;
+        const primary: PrimaryWeaponId =
+          parsed.primary &&
+          (['rifle', 'smg', 'shotgun', 'sniper', 'lmg'] as string[]).includes(parsed.primary)
+            ? parsed.primary
+            : defaults.primary;
+        const secondary: SecondaryWeaponId =
+          parsed.secondary &&
+          (['pistol', 'smg', 'rifle'] as string[]).includes(parsed.secondary)
+            ? parsed.secondary
+            : defaults.secondary;
+        return { primary, secondary };
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return defaults;
+  }
+
+  private saveLoadout(): void {
+    try {
+      localStorage.setItem(STORAGE_LOADOUT_KEY, JSON.stringify(this.loadout));
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  private loadSurvivalRecord(): SurvivalRecord {
+    const defaults: SurvivalRecord = { bestWave: 0, bestKills: 0, bestTimeSec: 0 };
+    try {
+      const raw = localStorage.getItem(STORAGE_SURVIVAL_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<SurvivalRecord>;
+        return {
+          bestWave: typeof parsed.bestWave === 'number' ? parsed.bestWave : 0,
+          bestKills: typeof parsed.bestKills === 'number' ? parsed.bestKills : 0,
+          bestTimeSec: typeof parsed.bestTimeSec === 'number' ? parsed.bestTimeSec : 0
+        };
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return defaults;
+  }
+
+  private updateAndSaveSurvivalRecord(): void {
+    const improved =
+      this.survivalWave > this.survivalRecord.bestWave ||
+      (this.survivalWave === this.survivalRecord.bestWave && this.kills > this.survivalRecord.bestKills) ||
+      (this.survivalWave === this.survivalRecord.bestWave &&
+        this.kills === this.survivalRecord.bestKills &&
+        this.missionElapsed > this.survivalRecord.bestTimeSec);
+
+    if (improved) {
+      this.survivalRecord = {
+        bestWave: Math.max(this.survivalRecord.bestWave, this.survivalWave),
+        bestKills: Math.max(this.survivalRecord.bestKills, this.kills),
+        bestTimeSec: Math.max(this.survivalRecord.bestTimeSec, Math.floor(this.missionElapsed))
+      };
+      try {
+        localStorage.setItem(STORAGE_SURVIVAL_KEY, JSON.stringify(this.survivalRecord));
+      } catch {
+        // Ignore storage errors
+      }
+      this.ui.setSurvivalRecord(this.survivalRecord);
     }
   }
 

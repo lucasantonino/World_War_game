@@ -550,4 +550,277 @@ export class AudioEngine {
     osc.start(t);
     osc.stop(t + 0.055);
   }
+
+  public playShotgunShot(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    // Heavy low-end boom
+    const sub = this.ctx.createOscillator();
+    const sg = this.ctx.createGain();
+    sub.type = 'triangle';
+    sub.frequency.setValueAtTime(145, t);
+    sub.frequency.exponentialRampToValueAtTime(34, t + 0.24);
+    sg.gain.setValueAtTime(0.58, t);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.26);
+    sub.connect(sg);
+    sg.connect(this.sfxBus);
+    sub.start(t);
+    sub.stop(t + 0.28);
+
+    // Wide scatter noise blast
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(2400, t);
+    lp.frequency.exponentialRampToValueAtTime(280, t + 0.36);
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.68, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+    src.connect(lp);
+    lp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.4);
+
+    // Pump-action rack click
+    const pump = this.ctx.createOscillator();
+    const pg = this.ctx.createGain();
+    pump.type = 'square';
+    pump.frequency.setValueAtTime(480, t + 0.28);
+    pump.frequency.exponentialRampToValueAtTime(310, t + 0.34);
+    pg.gain.setValueAtTime(0.001, t + 0.27);
+    pg.gain.linearRampToValueAtTime(0.07, t + 0.285);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.36);
+    pump.connect(pg);
+    pg.connect(this.sfxBus);
+    pump.start(t + 0.27);
+    pump.stop(t + 0.37);
+  }
+
+  public playSniperShot(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    // Punchy high-velocity body
+    const osc = this.ctx.createOscillator();
+    const og = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(290, t);
+    osc.frequency.exponentialRampToValueAtTime(42, t + 0.18);
+    og.gain.setValueAtTime(0.45, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    osc.connect(og);
+    og.connect(this.sfxBus);
+    osc.start(t);
+    osc.stop(t + 0.22);
+
+    // Supersonic crack & long canyon echo tail
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(2250, t);
+    bp.frequency.exponentialRampToValueAtTime(620, t + 0.45);
+    bp.Q.value = 0.85;
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.72, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.52);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.54);
+  }
+
+  public playPistolShot(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    const osc = this.ctx.createOscillator();
+    const og = this.ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(270, t);
+    osc.frequency.exponentialRampToValueAtTime(68, t + 0.085);
+    og.gain.setValueAtTime(0.32, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+    osc.connect(og);
+    og.connect(this.sfxBus);
+    osc.start(t);
+    osc.stop(t + 0.1);
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1750;
+    bp.Q.value = 0.9;
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.38, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.12);
+  }
+
+  public playMeleeSwipe(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(420, t);
+    bp.frequency.exponentialRampToValueAtTime(1600, t + 0.08);
+    bp.frequency.exponentialRampToValueAtTime(340, t + 0.19);
+    bp.Q.value = 1.8;
+
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.001, t);
+    ng.gain.linearRampToValueAtTime(0.3, t + 0.05);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.21);
+
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.22);
+
+    // Steel shimmer
+    const osc = this.ctx.createOscillator();
+    const og = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(2400, t);
+    osc.frequency.exponentialRampToValueAtTime(1450, t + 0.14);
+    og.gain.setValueAtTime(0.05, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+    osc.connect(og);
+    og.connect(this.sfxBus);
+    osc.start(t);
+    osc.stop(t + 0.16);
+  }
+
+  public playRadioArtilleryCall(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    // Radio squelch
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1950;
+    bp.Q.value = 2.6;
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.11, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.36);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.38);
+
+    // Twin tactical confirmation tone
+    for (const [offset, freq] of [
+      [0.05, 1180],
+      [0.18, 1480]
+    ]) {
+      const osc = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t + offset);
+      g.gain.setValueAtTime(0.1, t + offset);
+      g.gain.exponentialRampToValueAtTime(0.001, t + offset + 0.09);
+      osc.connect(g);
+      g.connect(this.sfxBus);
+      osc.start(t + offset);
+      osc.stop(t + offset + 0.1);
+    }
+  }
+
+  public playTankCannonShot(): void {
+    if (!this.ctx || !this.noiseBuffer || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+
+    // Heavy 75mm breach punch
+    const sub = this.ctx.createOscillator();
+    const sg = this.ctx.createGain();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(115, t);
+    sub.frequency.exponentialRampToValueAtTime(28, t + 0.52);
+    sg.gain.setValueAtTime(0.76, t);
+    sg.gain.exponentialRampToValueAtTime(0.001, t + 0.56);
+    sub.connect(sg);
+    sg.connect(this.sfxBus);
+    sub.start(t);
+    sub.stop(t + 0.58);
+
+    // Metallic breech clack
+    const clack = this.ctx.createOscillator();
+    const cg = this.ctx.createGain();
+    clack.type = 'triangle';
+    clack.frequency.setValueAtTime(760, t);
+    clack.frequency.exponentialRampToValueAtTime(220, t + 0.12);
+    cg.gain.setValueAtTime(0.24, t);
+    cg.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
+    clack.connect(cg);
+    cg.connect(this.sfxBus);
+    clack.start(t);
+    clack.stop(t + 0.14);
+
+    // Blast roar
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuffer;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1900, t);
+    lp.frequency.exponentialRampToValueAtTime(170, t + 0.85);
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.78, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+    src.connect(lp);
+    lp.connect(ng);
+    ng.connect(this.sfxBus);
+    src.start(t);
+    src.stop(t + 0.92);
+  }
+
+  public playStrafeSiren(): void {
+    if (!this.ctx || !this.sfxBus) return;
+    const t = this.ctx.currentTime;
+    const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
+    if (panner) {
+      panner.pan.setValueAtTime(-0.85, t);
+      panner.pan.linearRampToValueAtTime(0.85, t + 2.4);
+      panner.connect(this.sfxBus);
+    }
+    const target = panner ?? this.sfxBus;
+
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(1180, t);
+    osc.frequency.exponentialRampToValueAtTime(340, t + 2.35);
+
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1100, t);
+    bp.frequency.exponentialRampToValueAtTime(420, t + 2.35);
+    bp.Q.value = 1.6;
+
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.18, t + 0.35);
+    g.gain.setValueAtTime(0.16, t + 1.65);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 2.45);
+
+    osc.connect(bp);
+    bp.connect(g);
+    g.connect(target);
+    osc.start(t);
+    osc.stop(t + 2.5);
+  }
 }

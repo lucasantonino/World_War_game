@@ -6,6 +6,10 @@ import {
   MissionConfig,
   MissionEndSummary,
   MissionId,
+  PlayerLoadout,
+  PrimaryWeaponId,
+  SecondaryWeaponId,
+  SurvivalRecord,
   TouchControlMode,
   WeaponId
 } from '../types';
@@ -23,6 +27,7 @@ export interface UICallbacks {
   onReturnToMenu: () => void;
   onNextMission: () => void;
   onSettingsChanged: (settings: GameSettings) => void;
+  onLoadoutChanged?: (loadout: PlayerLoadout) => void;
   onTouchMove: (x: number, y: number, sprinting: boolean) => void;
   onTouchLook: (dx: number, dy: number) => void;
   onTouchFire: (firing: boolean) => void;
@@ -32,9 +37,12 @@ export interface UICallbacks {
   onTouchSelectWeapon: (id: WeaponId) => void;
   onTouchCycleWeapon: () => void;
   onTouchPause: () => void;
+  onTouchMelee?: () => void;
+  onTouchBinoculars?: () => void;
 }
 
 const GORE_ACK_STORAGE_KEY = 'tdn_gore_ack_v1';
+const SURVIVAL_STORAGE_KEY = 'tdn_survival_best_v1';
 
 const COVER_LABELS: Record<HUDState['coverState'], string> = {
   dugout: 'ABRIGO SEGURO',
@@ -43,14 +51,44 @@ const COVER_LABELS: Record<HUDState['coverState'], string> = {
   exposed: 'EXPOSTO!'
 };
 
+const SHORT_WEAPON_NAMES: Record<WeaponId, string> = {
+  rifle: 'Fuzil',
+  smg: 'SMG',
+  shotgun: 'Escopeta',
+  sniper: 'Sniper',
+  lmg: 'MG-38',
+  pistol: 'Pistola',
+  bazooka: 'Bazuca',
+  grenade: 'Granada'
+};
+
+const PRIMARY_OPTIONS: Array<{ id: PrimaryWeaponId; label: string; unlockHint: string }> = [
+  { id: 'rifle', label: 'Fuzil M-42', unlockHint: 'Padrão' },
+  { id: 'smg', label: 'SMG-44', unlockHint: 'Padrão' },
+  { id: 'shotgun', label: 'Escopeta M-97', unlockHint: 'OP-01 / Saque' },
+  { id: 'sniper', label: 'Sniper M-40', unlockHint: 'OP-02 / Saque' },
+  { id: 'lmg', label: 'MG-38 Leve', unlockHint: 'OP-03 / Saque' }
+];
+
+const SECONDARY_OPTIONS: Array<{ id: SecondaryWeaponId; label: string; unlockHint: string }> = [
+  { id: 'pistol', label: 'Pistola M-1911', unlockHint: 'Padrão' },
+  { id: 'smg', label: 'SMG-44', unlockHint: 'Padrão' },
+  { id: 'rifle', label: 'Fuzil M-42', unlockHint: 'OP-01 / Saque' }
+];
+
 export class UIManager {
   public onTouchSmoke: (() => void) | null = null;
+  public onTouchMelee: (() => void) | null = null;
+  public onTouchBinoculars: (() => void) | null = null;
 
   private root: HTMLElement;
   private callbacks: UICallbacks;
 
   private selectedMissionId: MissionId = 0;
   private completedMissions = new Set<MissionId>();
+  private unlockedWeapons = new Set<WeaponId>(['rifle', 'smg', 'pistol', 'bazooka', 'grenade']);
+  private loadout: PlayerLoadout = { primary: 'rifle', secondary: 'pistol' };
+  private survivalRecord: SurvivalRecord = { bestWave: 0, bestKills: 0, bestTimeSec: 0 };
   private settings: GameSettings;
 
   // Screen containers
@@ -73,6 +111,7 @@ export class UIManager {
   private swarmCountEl!: HTMLElement;
   private checkpointToastEl!: HTMLElement;
   private airRaidEl!: HTMLElement;
+  private mortarWarnEl!: HTMLElement;
   private radioEl!: HTMLElement;
   private reticleEl!: HTMLElement;
   private reticleTop!: HTMLElement;
@@ -85,6 +124,13 @@ export class UIManager {
   private actionLabelEl!: HTMLElement;
   private actionFillEl!: HTMLElement;
   private grenadeWarnEl!: HTMLElement;
+  private sniperScopeEl!: HTMLElement;
+  private binocularsEl!: HTMLElement;
+  private binoTelemetryEl!: HTMLElement;
+  private tankHudEl!: HTMLElement;
+  private tankHpTextEl!: HTMLElement;
+  private tankHpFillEl!: HTMLElement;
+  private tankCannonStatusEl!: HTMLElement;
   private coverPillEl!: HTMLElement;
   private coverTextEl!: HTMLElement;
   private postureTextEl!: HTMLElement;
@@ -105,6 +151,7 @@ export class UIManager {
   private touchBtnInteract!: HTMLElement;
   private touchBtnAds!: HTMLElement;
   private touchBtnSmoke!: HTMLElement;
+  private touchBtnBino!: HTMLElement;
   private goreWarningBannerEl!: HTMLElement;
   private orientationWarnEl!: HTMLElement;
   private dismissedPortraitWarning = false;
@@ -117,6 +164,7 @@ export class UIManager {
   private pauseTouchSelect!: HTMLSelectElement;
   private endRetryBtn!: HTMLButtonElement;
   private endCheckpointBtn!: HTMLButtonElement;
+  private opsHeadingCountEl!: HTMLElement;
 
   constructor(
     root: HTMLElement,
@@ -128,6 +176,7 @@ export class UIManager {
     this.settings = { ...initialSettings };
     this.completedMissions = completed;
     this.callbacks = callbacks;
+    this.survivalRecord = this.loadSurvivalRecord();
 
     this.buildDOM();
     this.buildCompassTicks();
@@ -141,6 +190,17 @@ export class UIManager {
 
   public setSelectedMission(id: MissionId): void {
     this.selectedMissionId = id;
+    this.renderOperationsList();
+  }
+
+  public setArsenalState(unlocked: Set<WeaponId>, loadout: PlayerLoadout): void {
+    this.unlockedWeapons = new Set(unlocked);
+    this.loadout = { ...loadout };
+    this.renderLoadoutSelectors();
+  }
+
+  public setSurvivalRecord(record: SurvivalRecord): void {
+    this.survivalRecord = { ...record };
     this.renderOperationsList();
   }
 
@@ -176,11 +236,11 @@ export class UIManager {
       titleEl.setAttribute('style', 'color: #93cc87');
       subEl.textContent = `${summary.missionTitle} — Linha assegurada`;
       causeBox.classList.add('hidden');
-      nextBtn.classList.toggle('hidden', summary.missionId >= 3);
+      nextBtn.classList.toggle('hidden', summary.missionId >= 5 || summary.missionId === 99);
       this.endCheckpointBtn.classList.add('hidden');
       this.endRetryBtn.className = 'btn-secondary';
     } else {
-      titleEl.textContent = 'BAIXA EM COMBATE';
+      titleEl.textContent = summary.missionId === 99 ? 'FIM DA RESISTÊNCIA' : 'BAIXA EM COMBATE';
       titleEl.setAttribute('style', 'color: #ef5343');
       subEl.textContent = `${summary.missionTitle} — Você caiu no campo de batalha`;
       causeBox.classList.remove('hidden');
@@ -202,7 +262,7 @@ export class UIManager {
     const secs = Math.floor(summary.durationSeconds % 60);
     const acc =
       summary.shotsFired > 0
-        ? Math.round((summary.shotsHit / summary.shotsFired) * 100)
+        ? Math.min(100, Math.round((summary.shotsHit / summary.shotsFired) * 100))
         : 0;
 
     this.endEl.querySelector('#stat-time')!.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
@@ -264,7 +324,9 @@ export class UIManager {
     // 4. Objective, Phase Badge, Checkpoint Toast & Alerts
     const totalPhases = Math.max(1, state.totalPhases);
     const diffLabel = DIFFICULTY_CONFIGS[state.difficulty].label.toUpperCase();
-    this.objPhaseEl.textContent = `FASE ${state.phaseIndex + 1}/${totalPhases} • ${diffLabel}`;
+    this.objPhaseEl.textContent = state.isSurvival
+      ? `SOBREVIVÊNCIA • VAGA ${state.survivalWave} • ${diffLabel}`
+      : `FASE ${state.phaseIndex + 1}/${totalPhases} • ${diffLabel}`;
     this.objMainEl.textContent = state.objectiveText;
     const distTag =
       state.objectiveDistance !== null ? ` • ${Math.round(state.objectiveDistance)}m` : '';
@@ -292,6 +354,13 @@ export class UIManager {
       this.airRaidEl.classList.add('hidden');
     }
 
+    if (state.mortarWarning) {
+      this.mortarWarnEl.textContent = state.mortarWarning;
+      this.mortarWarnEl.classList.remove('hidden');
+    } else {
+      this.mortarWarnEl.classList.add('hidden');
+    }
+
     if (state.radioCaption) {
       this.radioEl.textContent = `RÁDIO ALIADO: "${state.radioCaption}"`;
       this.radioEl.classList.remove('hidden');
@@ -299,8 +368,43 @@ export class UIManager {
       this.radioEl.classList.add('hidden');
     }
 
-    // 5. Reticle & Hitmarker
-    const hideReticle = state.adsFactor > 0.45 && state.weaponId !== 'bazooka';
+    // 5. Special Optical & Vehicle Overlays
+    const showSniperScope = state.sniperScopeActive && !state.binocularsActive && !state.inAllyTank;
+    const showBinoculars = state.binocularsActive && !state.inAllyTank;
+    const showTankHud = state.inAllyTank;
+
+    this.sniperScopeEl.classList.toggle('hidden', !showSniperScope);
+    this.binocularsEl.classList.toggle('hidden', !showBinoculars);
+    this.tankHudEl.classList.toggle('hidden', !showTankHud);
+
+    if (showBinoculars) {
+      this.binoTelemetryEl.textContent = state.artilleryCallReady
+        ? 'ARTILHARIA ALIADA: PRONTA • [LMB] CHAMAR SALVA DE OBUSES'
+        : `ARTILHARIA ALIADA: RECARREGANDO (${Math.ceil(state.artilleryCallCooldown)}s)`;
+      this.binoTelemetryEl.classList.toggle('ready', state.artilleryCallReady);
+    }
+
+    if (showTankHud) {
+      const tankPct =
+        state.allyTankMaxHp > 0
+          ? Math.max(0, Math.min(100, Math.round((state.allyTankHp / state.allyTankMaxHp) * 100)))
+          : 0;
+      this.tankHpTextEl.textContent = `${Math.max(0, Math.ceil(state.allyTankHp))} / ${state.allyTankMaxHp}`;
+      this.tankHpFillEl.style.width = `${tankPct}%`;
+      this.tankHpFillEl.classList.toggle('low', tankPct < 35);
+      this.tankCannonStatusEl.textContent =
+        state.allyTankShellCooldown <= 0.05
+          ? 'CANHÃO 75mm: PRONTO'
+          : `CANHÃO 75mm: ${state.allyTankShellCooldown.toFixed(1)}s`;
+      this.tankCannonStatusEl.classList.toggle('ready', state.allyTankShellCooldown <= 0.05);
+    }
+
+    // 6. Reticle & Hitmarker
+    const hideReticle =
+      showSniperScope ||
+      showBinoculars ||
+      showTankHud ||
+      (state.adsFactor > 0.45 && state.weaponId !== 'bazooka');
     this.reticleEl.classList.toggle('hidden', hideReticle);
     const gap = Math.round(state.spreadPx);
     this.reticleTop.style.top = `${-7 - gap}px`;
@@ -311,7 +415,7 @@ export class UIManager {
     this.hitmarkerEl.style.opacity = state.hitMarkerTimer > 0 ? '0.95' : '0';
     this.hitmarkerEl.classList.toggle('crit', state.hitMarkerCrit);
 
-    // 6. Contextual prompt, action bar & grenade warning
+    // 7. Contextual prompt, action bar & grenade warning
     if (state.interactPrompt) {
       this.interactEl.textContent = state.interactPrompt;
       this.interactEl.classList.remove('hidden');
@@ -342,23 +446,34 @@ export class UIManager {
       this.grenadeWarnEl.classList.add('hidden');
     }
 
-    // 7. Cover, Peek Danger & Vitals
-    if (state.inSmokeScreen) {
+    // 8. Cover, Peek Danger & Vitals
+    if (state.inAllyTank) {
+      this.coverPillEl.className = 'cover-pill tank-armored';
+      this.coverTextEl.textContent = 'BLINDADO ALIADO';
+      this.postureTextEl.textContent = 'EMBARCADO';
+    } else if (state.inSmokeScreen) {
       this.coverPillEl.className = 'cover-pill smoke-hidden';
       this.coverTextEl.textContent = 'OCULTO NA FUMAÇA';
+      this.postureTextEl.textContent = state.mgMounted
+        ? 'METRALHADORA'
+        : state.isCrouching
+          ? 'AGACHADO'
+          : state.isSprinting
+            ? 'CORRENDO'
+            : 'EM PÉ';
     } else {
       this.coverPillEl.className = `cover-pill ${state.coverState}`;
       this.coverTextEl.textContent = COVER_LABELS[state.coverState];
+      this.postureTextEl.textContent = state.mgMounted
+        ? 'METRALHADORA'
+        : state.isCrouching
+          ? 'AGACHADO'
+          : state.isSprinting
+            ? 'CORRENDO'
+            : 'EM PÉ';
     }
-    this.postureTextEl.textContent = state.mgMounted
-      ? 'METRALHADORA'
-      : state.isCrouching
-        ? 'AGACHADO'
-        : state.isSprinting
-          ? 'CORRENDO'
-          : 'EM PÉ';
 
-    if (state.peekDanger > 0.12) {
+    if (state.peekDanger > 0.12 && !state.inAllyTank) {
       const peekPct = Math.min(100, Math.round(state.peekDanger * 100));
       const isCritical = peekPct > 65;
       this.peekBarEl.classList.remove('hidden');
@@ -378,13 +493,24 @@ export class UIManager {
     this.bandagesEl.textContent = `CURATIVOS [H]: ${state.bandages}`;
     this.regenTagEl.textContent = state.isRegenerating ? '+REGEN' : '';
 
-    // 8. Weapon & Ammo
-    if (state.mgMounted) {
+    // 9. Weapon & Ammo
+    if (state.inAllyTank) {
+      this.weaponNameEl.textContent = 'Canhão 75mm & Coaxial';
+      this.ammoReadoutEl.innerHTML =
+        state.allyTankShellCooldown <= 0.05
+          ? `PRONTO <span class="ammo-reserve">75mm</span>`
+          : `${state.allyTankShellCooldown.toFixed(1)}s <span class="ammo-reserve">RECARGA</span>`;
+    } else if (state.mgMounted) {
       this.weaponNameEl.textContent = 'Metralhadora Pesada M-19';
       const heatPct = Math.round(state.mgHeat * 100);
       this.ammoReadoutEl.innerHTML = state.mgOverheated
         ? `<span style="color:#ef5343;font-size:1.15rem">SUPERAQUECIDA</span>`
         : `${heatPct}% <span class="ammo-reserve">CALOR</span>`;
+    } else if (state.binocularsActive) {
+      this.weaponNameEl.textContent = 'Binóculo Tático';
+      this.ammoReadoutEl.innerHTML = state.artilleryCallReady
+        ? `PRONTA <span class="ammo-reserve">SALVA</span>`
+        : `${Math.ceil(state.artilleryCallCooldown)}s <span class="ammo-reserve">ARTILHARIA</span>`;
     } else {
       this.weaponNameEl.textContent = WEAPON_STATS[state.weaponId].name;
       if (state.weaponId === 'grenade') {
@@ -393,11 +519,26 @@ export class UIManager {
         this.ammoReadoutEl.innerHTML = `${state.ammoInMag} <span class="ammo-reserve">/ ${state.ammoReserve}</span>`;
       }
     }
-    this.extraAmmoEl.textContent = `GRANADAS [G]: ${state.grenades}  •  FUMAÇA [X]: ${state.smokeGrenades}  •  FOGUETES: ${state.rockets}`;
 
-    const slotOrder = ['rifle', 'smg', 'bazooka', 'grenade'];
+    const artText = state.artilleryCallReady
+      ? 'PRONTA'
+      : `${Math.ceil(state.artilleryCallCooldown)}s`;
+    this.extraAmmoEl.textContent = `GRANADAS [G]: ${state.grenades} • FUMAÇA [X]: ${state.smokeGrenades} • FOGUETES: ${state.rockets} • ART. [B]: ${artText}`;
+
+    const slotWeapons: WeaponId[] = [
+      state.primaryWeaponId,
+      state.secondaryWeaponId,
+      'bazooka',
+      'grenade'
+    ];
     this.slotEls.forEach((el, idx) => {
-      el.classList.toggle('active', !state.mgMounted && state.weaponId === slotOrder[idx]);
+      const wId = slotWeapons[idx];
+      el.dataset.slot = wId;
+      el.textContent = `[${idx + 1}] ${SHORT_WEAPON_NAMES[wId]}`;
+      el.classList.toggle(
+        'active',
+        !state.mgMounted && !state.inAllyTank && !state.binocularsActive && state.weaponId === wId
+      );
     });
 
     this.controlsToastEl.classList.toggle('hidden', state.touchActive || !state.showControlsHint);
@@ -405,10 +546,26 @@ export class UIManager {
     this.touchBtnInteract.classList.toggle('highlight', Boolean(state.interactPrompt));
     this.touchBtnAds.classList.toggle('active', state.adsFactor > 0.4);
     this.touchBtnSmoke.classList.toggle('empty', state.smokeGrenades <= 0);
+    this.touchBtnBino.classList.toggle('active', state.binocularsActive);
 
     const showPortraitWarning =
       state.touchActive && window.innerHeight > window.innerWidth && !this.dismissedPortraitWarning;
     this.orientationWarnEl.classList.toggle('hidden', !showPortraitWarning);
+  }
+
+  private loadSurvivalRecord(): SurvivalRecord {
+    try {
+      const raw = localStorage.getItem(SURVIVAL_STORAGE_KEY);
+      if (!raw) return { bestWave: 0, bestKills: 0, bestTimeSec: 0 };
+      const parsed = JSON.parse(raw) as Partial<SurvivalRecord>;
+      return {
+        bestWave: typeof parsed.bestWave === 'number' ? parsed.bestWave : 0,
+        bestKills: typeof parsed.bestKills === 'number' ? parsed.bestKills : 0,
+        bestTimeSec: typeof parsed.bestTimeSec === 'number' ? parsed.bestTimeSec : 0
+      };
+    } catch {
+      return { bestWave: 0, bestKills: 0, bestTimeSec: 0 };
+    }
   }
 
   private isGoreAcknowledged(): boolean {
@@ -452,10 +609,22 @@ export class UIManager {
             </p>
             <div class="survival-rules">
               <div class="survival-rule-row"><span class="rule-tag">COBERTURA</span><span>Abaixe-se com <b>[C]</b> abaixo do parapeito e espie com <b>[Q/E]</b> ou <b>[Botão Direito]</b>.</span></div>
-              <div class="survival-rule-row"><span class="rule-tag">BOMBARDEIO</span><span>Ao ouvir a sirene, corra para o <b>ABRIGO</b> subterrâneo na parede traseira.</span></div>
-              <div class="survival-rule-row"><span class="rule-tag">ANTITANQUE</span><span>Fuzis ricocheteiam em blindados — use a <b>Bazuca [3]</b> nos flancos ou traseira.</span></div>
+              <div class="survival-rule-row"><span class="rule-tag">TÁTICA</span><span><b>[V]</b> Baioneta corpo a corpo • <b>[B]</b> Binóculo para chamar barragem de artilharia.</span></div>
+              <div class="survival-rule-row"><span class="rule-tag">ANTITANQUE</span><span>Use <b>Bazuca [3]</b> nos flancos ou embarque em blindados aliados com <b>[F]</b>.</span></div>
               <div class="survival-rule-row"><span class="rule-tag">HEMORRAGIA</span><span>Ferimentos graves sangram até a morte. Segure <b>[H]</b> protegido para estancar.</span></div>
             </div>
+
+            <div class="loadout-panel">
+              <div class="loadout-row">
+                <span class="loadout-label">PRIMÁRIA [1]</span>
+                <div id="loadout-primary-list" class="loadout-chips"></div>
+              </div>
+              <div class="loadout-row">
+                <span class="loadout-label">SECUNDÁRIA [2]</span>
+                <div id="loadout-secondary-list" class="loadout-chips"></div>
+              </div>
+            </div>
+
             <div class="difficulty-selector" role="group" aria-label="Selecionar dificuldade">
               ${(['recruit', 'veteran', 'infernal'] as DifficultyLevel[])
                 .map(
@@ -476,7 +645,7 @@ export class UIManager {
           <div class="operations-panel">
             <div class="panel-heading">
               <span>Teatro de Operações</span>
-              <span style="font-family:var(--font-mono);font-size:0.74rem;color:var(--text-secondary)">4 MISSÕES TÁTICAS</span>
+              <span id="ops-heading-count" style="font-family:var(--font-mono);font-size:0.74rem;color:var(--text-secondary)">OPERAÇÕES + SOBREVIVÊNCIA</span>
             </div>
             <div id="ops-list" class="ops-list"></div>
           </div>
@@ -550,10 +719,10 @@ export class UIManager {
             <div class="control-pair"><span>Agachar / Escalar</span><span><kbd>C</kbd> <kbd>Espaço</kbd></span></div>
             <div class="control-pair"><span>Espiar Esq / Dir</span><span><kbd>Q</kbd> <kbd>E</kbd></span></div>
             <div class="control-pair"><span>Atirar / Mirar</span><span><kbd>LMB</kbd> <kbd>RMB</kbd></span></div>
-            <div class="control-pair"><span>Armas / Recarregar</span><span><kbd>1-4</kbd> <kbd>R</kbd></span></div>
+            <div class="control-pair"><span>Armas / Recarregar</span><span><kbd>1-5</kbd> <kbd>R</kbd></span></div>
+            <div class="control-pair"><span>Baioneta / Binóculo</span><span><kbd>V</kbd> <kbd>B</kbd></span></div>
             <div class="control-pair"><span>Frag / Fumaça</span><span><kbd>G</kbd> <kbd>X</kbd></span></div>
             <div class="control-pair"><span>Curativo / Interagir</span><span><kbd>H</kbd> <kbd>F</kbd></span></div>
-            <div class="control-pair"><span>Pausar</span><span><kbd>ESC</kbd></span></div>
           </div>
           <div class="cta-row" style="justify-content:space-between">
             <div style="display:flex;gap:10px">
@@ -598,9 +767,42 @@ export class UIManager {
         <div id="vig-dust" class="vignette-dust"></div>
         <div id="damage-arcs" class="damage-arcs-layer"></div>
 
+        <!-- SNIPER SCOPE OVERLAY -->
+        <div id="sniper-scope-overlay" class="sniper-scope-overlay hidden">
+          <div class="scope-cross-h"></div>
+          <div class="scope-cross-v"></div>
+          <div class="scope-center-dot"></div>
+          <div class="scope-ring"></div>
+        </div>
+
+        <!-- BINOCULARS OVERLAY -->
+        <div id="binoculars-overlay" class="binoculars-overlay hidden">
+          <div class="bino-lenses">
+            <div class="bino-reticle-h"></div>
+            <div class="bino-reticle-v"></div>
+            <div class="bino-center-cross"></div>
+          </div>
+          <div id="bino-telemetry" class="bino-telemetry ready">ARTILHARIA ALIADA: PRONTA • [LMB] CHAMAR SALVA</div>
+        </div>
+
+        <!-- TANK HUD OVERLAY -->
+        <div id="tank-hud-overlay" class="tank-hud-overlay hidden">
+          <div class="tank-slit-frame"></div>
+          <div class="tank-crosshair"></div>
+          <div class="tank-status-panel tabular">
+            <div class="tank-status-row">
+              <span>BLINDAGEM DO TANQUE ALIADO</span>
+              <span id="tank-hp-text">500 / 500</span>
+            </div>
+            <div class="tank-hp-track"><div id="tank-hp-fill" class="tank-hp-fill" style="width:100%"></div></div>
+            <div id="tank-cannon-status" class="tank-cannon-status ready">CANHÃO 75mm: PRONTO</div>
+            <div class="tank-controls-hint">[WASD] Dirigir • [LMB] Canhão 75mm • [RMB/Espaço] Coaxial • [F] Desembarcar</div>
+          </div>
+        </div>
+
         <div id="controls-toast" class="controls-toast">
-          [WASD] Mover • [C] Agachar • [Q/E] Espiar • [Espaço] Escalar<br />
-          [1-4] Armas • [G] Frag • [X] Fumaça • [H] Curativo • [F] Interagir
+          [WASD] Mover • [C] Agachar • [Q/E] Espiar • [V] Baioneta • [B] Binóculo<br />
+          [1-5] Armas • [G] Frag • [X] Fumaça • [H] Curativo • [F] Interagir
         </div>
 
         <div class="hud-top">
@@ -617,6 +819,7 @@ export class UIManager {
           </div>
           <div id="hud-checkpoint-toast" class="checkpoint-toast hidden"></div>
           <div id="hud-air-raid" class="air-raid-banner hidden">ALERTA AÉREO</div>
+          <div id="hud-mortar-warning" class="mortar-warning hidden">MORTEIRO CALIBRADO — MOVA-SE!</div>
         </div>
 
         <div id="hud-radio" class="radio-caption hidden"></div>
@@ -671,7 +874,7 @@ export class UIManager {
           </div>
           <div class="weapon-slots">
             <div class="slot-chip active" data-slot="rifle">[1] Fuzil</div>
-            <div class="slot-chip" data-slot="smg">[2] SMG</div>
+            <div class="slot-chip" data-slot="pistol">[2] Pistola</div>
             <div class="slot-chip" data-slot="bazooka">[3] Bazuca</div>
             <div class="slot-chip" data-slot="grenade">[4] Granada</div>
           </div>
@@ -694,6 +897,8 @@ export class UIManager {
             <button id="touch-btn-jump" type="button" class="touch-btn">ESCALAR</button>
             <button id="touch-btn-heal" type="button" class="touch-btn">CURATIVO</button>
             <button id="touch-btn-interact" type="button" class="touch-btn">INTERAGIR</button>
+            <button id="touch-btn-bino" type="button" class="touch-btn">BINÓCULO</button>
+            <button id="touch-btn-melee" type="button" class="touch-btn">BAIONETA</button>
           </div>
 
           <div class="touch-cluster-right">
@@ -734,6 +939,7 @@ export class UIManager {
     this.swarmCountEl = this.root.querySelector('#hud-swarm-count')!;
     this.checkpointToastEl = this.root.querySelector('#hud-checkpoint-toast')!;
     this.airRaidEl = this.root.querySelector('#hud-air-raid')!;
+    this.mortarWarnEl = this.root.querySelector('#hud-mortar-warning')!;
     this.radioEl = this.root.querySelector('#hud-radio')!;
     this.reticleEl = this.root.querySelector('#hud-reticle')!;
     this.reticleTop = this.root.querySelector('#ret-t')!;
@@ -746,6 +952,13 @@ export class UIManager {
     this.actionLabelEl = this.root.querySelector('#hud-action-label')!;
     this.actionFillEl = this.root.querySelector('#hud-action-fill')!;
     this.grenadeWarnEl = this.root.querySelector('#hud-grenade-warn')!;
+    this.sniperScopeEl = this.root.querySelector('#sniper-scope-overlay')!;
+    this.binocularsEl = this.root.querySelector('#binoculars-overlay')!;
+    this.binoTelemetryEl = this.root.querySelector('#bino-telemetry')!;
+    this.tankHudEl = this.root.querySelector('#tank-hud-overlay')!;
+    this.tankHpTextEl = this.root.querySelector('#tank-hp-text')!;
+    this.tankHpFillEl = this.root.querySelector('#tank-hp-fill')!;
+    this.tankCannonStatusEl = this.root.querySelector('#tank-cannon-status')!;
     this.coverPillEl = this.root.querySelector('#hud-cover-pill')!;
     this.coverTextEl = this.root.querySelector('#hud-cover-text')!;
     this.postureTextEl = this.root.querySelector('#hud-posture-text')!;
@@ -766,8 +979,10 @@ export class UIManager {
     this.touchBtnInteract = this.root.querySelector('#touch-btn-interact')!;
     this.touchBtnAds = this.root.querySelector('#touch-btn-ads')!;
     this.touchBtnSmoke = this.root.querySelector('#touch-btn-smoke')!;
+    this.touchBtnBino = this.root.querySelector('#touch-btn-bino')!;
     this.goreWarningBannerEl = this.root.querySelector('#gore-warning-banner')!;
     this.orientationWarnEl = this.root.querySelector('#orientation-warning')!;
+    this.opsHeadingCountEl = this.root.querySelector('#ops-heading-count')!;
 
     this.diffBtns = Array.from(this.root.querySelectorAll('.diff-btn')) as HTMLButtonElement[];
     this.diffDescEl = this.root.querySelector('#menu-diff-desc')!;
@@ -777,18 +992,96 @@ export class UIManager {
     this.endRetryBtn = this.root.querySelector('#btn-end-retry') as HTMLButtonElement;
     this.endCheckpointBtn = this.root.querySelector('#btn-end-checkpoint') as HTMLButtonElement;
 
+    this.renderLoadoutSelectors();
     this.renderOperationsList();
     this.bindButtonEvents();
     this.bindTouchControls();
   }
 
+  private isWeaponAvailableForSelectedMission(id: WeaponId): boolean {
+    if (this.unlockedWeapons.has(id)) return true;
+    if (this.selectedMissionId === 99) return true;
+    if (id === 'shotgun' && this.selectedMissionId >= 1) return true;
+    if (id === 'sniper' && this.selectedMissionId >= 2) return true;
+    if (id === 'lmg' && this.selectedMissionId >= 3) return true;
+    return false;
+  }
+
+  private renderLoadoutSelectors(): void {
+    const primList = this.root.querySelector('#loadout-primary-list');
+    const secList = this.root.querySelector('#loadout-secondary-list');
+    if (!primList || !secList) return;
+
+    primList.innerHTML = PRIMARY_OPTIONS.map((opt) => {
+      const unlocked = this.isWeaponAvailableForSelectedMission(opt.id);
+      const selected = this.loadout.primary === opt.id;
+      return `
+        <button
+          type="button"
+          class="loadout-chip ${selected ? 'active' : ''} ${unlocked ? '' : 'locked'}"
+          data-primary="${opt.id}"
+          ${unlocked ? '' : 'disabled'}
+          title="${unlocked ? opt.label : `Desbloqueia em ${opt.unlockHint}`}"
+        >
+          <span>${opt.label}</span>
+          ${unlocked ? '' : `<small class="lock-hint">${opt.unlockHint}</small>`}
+        </button>
+      `;
+    }).join('');
+
+    secList.innerHTML = SECONDARY_OPTIONS.map((opt) => {
+      const unlocked = this.isWeaponAvailableForSelectedMission(opt.id);
+      const selected = this.loadout.secondary === opt.id;
+      return `
+        <button
+          type="button"
+          class="loadout-chip ${selected ? 'active' : ''} ${unlocked ? '' : 'locked'}"
+          data-secondary="${opt.id}"
+          ${unlocked ? '' : 'disabled'}
+          title="${unlocked ? opt.label : `Desbloqueia em ${opt.unlockHint}`}"
+        >
+          <span>${opt.label}</span>
+          ${unlocked ? '' : `<small class="lock-hint">${opt.unlockHint}</small>`}
+        </button>
+      `;
+    }).join('');
+
+    primList.querySelectorAll('[data-primary]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = (btn as HTMLElement).dataset.primary as PrimaryWeaponId;
+        if (!id || !this.isWeaponAvailableForSelectedMission(id)) return;
+        this.loadout = { ...this.loadout, primary: id };
+        this.renderLoadoutSelectors();
+        this.callbacks.onLoadoutChanged?.(this.loadout);
+      });
+    });
+
+    secList.querySelectorAll('[data-secondary]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = (btn as HTMLElement).dataset.secondary as SecondaryWeaponId;
+        if (!id || !this.isWeaponAvailableForSelectedMission(id)) return;
+        this.loadout = { ...this.loadout, secondary: id };
+        this.renderLoadoutSelectors();
+        this.callbacks.onLoadoutChanged?.(this.loadout);
+      });
+    });
+  }
+
   private renderOperationsList(): void {
     const listEl = this.root.querySelector('#ops-list')!;
-    listEl.innerHTML = MISSIONS.map((m) => {
-      const done = this.completedMissions.has(m.id);
-      const selected = this.selectedMissionId === m.id;
-      return `
-        <button class="op-item ${selected ? 'selected' : ''}" data-op="${m.id}">
+    const campaignMissions = MISSIONS.filter((m) => m.id !== 99 && !m.isSurvival);
+    const survivalMission = MISSIONS.find((m) => m.id === 99 || m.isSurvival);
+
+    if (this.opsHeadingCountEl) {
+      this.opsHeadingCountEl.textContent = `${campaignMissions.length} OPERAÇÕES + SOBREVIVÊNCIA`;
+    }
+
+    const campaignHtml = campaignMissions
+      .map((m) => {
+        const done = this.completedMissions.has(m.id);
+        const selected = this.selectedMissionId === m.id;
+        return `
+        <button class="op-item mission-card ${selected ? 'selected' : ''}" data-op="${m.id}">
           <div class="op-top">
             <span class="op-title">${m.code} — ${m.title}</span>
             <span class="op-badge ${done ? 'done' : ''}">${done ? 'CONCLUÍDA' : 'DISPONÍVEL'}</span>
@@ -796,7 +1089,29 @@ export class UIManager {
           <div class="op-desc">${m.subtitle}</div>
         </button>
       `;
-    }).join('');
+      })
+      .join('');
+
+    const rec = this.survivalRecord;
+    const mins = Math.floor(rec.bestTimeSec / 60);
+    const secs = Math.floor(rec.bestTimeSec % 60);
+    const recordText = `Recorde Local: Vaga ${rec.bestWave} • Baixas: ${rec.bestKills} • Tempo: ${mins}:${secs.toString().padStart(2, '0')}`;
+    const survSelected = this.selectedMissionId === 99;
+    const survTitle = survivalMission
+      ? `${survivalMission.code} — ${survivalMission.title}`
+      : 'MODO SOBREVIVÊNCIA — TERRA ARRASADA';
+
+    const survivalHtml = `
+      <button class="op-item mission-card survival-card ${survSelected ? 'selected' : ''}" data-op="99">
+        <div class="op-top">
+          <span class="op-title">${survTitle}</span>
+          <span class="op-badge survival-badge">INFINITO</span>
+        </div>
+        <div class="op-desc">${recordText}</div>
+      </button>
+    `;
+
+    listEl.innerHTML = campaignHtml + survivalHtml;
 
     listEl.querySelectorAll('.op-item').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -804,6 +1119,7 @@ export class UIManager {
         this.selectedMissionId = id;
         this.callbacks.onSelectMission(id);
         this.renderOperationsList();
+        this.renderLoadoutSelectors();
       });
     });
   }
@@ -1070,6 +1386,16 @@ export class UIManager {
     bindHoldButton('#touch-btn-jump', 'Space');
     bindHoldButton('#touch-btn-heal', 'KeyH');
     bindTapButton('#touch-btn-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
+    bindTapButton('#touch-btn-bino', () => {
+      if (this.onTouchBinoculars) this.onTouchBinoculars();
+      else if (this.callbacks.onTouchBinoculars) this.callbacks.onTouchBinoculars();
+      else this.callbacks.onTouchKeyPress('KeyB');
+    });
+    bindTapButton('#touch-btn-melee', () => {
+      if (this.onTouchMelee) this.onTouchMelee();
+      else if (this.callbacks.onTouchMelee) this.callbacks.onTouchMelee();
+      else this.callbacks.onTouchKeyPress('KeyV');
+    });
 
     this.touchBtnAds.addEventListener('pointerdown', (e) => {
       e.preventDefault();

@@ -326,6 +326,61 @@ export class VFXSystem {
     this.spawnSprite(pos, new THREE.Vector3(0.4, 0.6, 0), 0x1a1a1a, 2.5, 7.5, 2.8, 0.78, 0, false);
   }
 
+  public spawnFlameJet(origin: THREE.Vector3, dir: THREE.Vector3): void {
+    this.tmpDir.copy(dir);
+    if (this.tmpDir.lengthSq() < 1e-5) {
+      this.tmpDir.set(0, 0, 1);
+    } else {
+      this.tmpDir.normalize();
+    }
+
+    // Two glowing flame tongues (yellow-orange core + deep orange envelope), strictly within MAX_PARTICLES=320 & 0 new PointLights
+    for (let i = 0; i < 2; i++) {
+      const speed = 13.5 + Math.random() * 5.0;
+      const spread = 0.16;
+      this.tmpVel.set(
+        this.tmpDir.x * speed + (Math.random() - 0.5) * speed * spread,
+        this.tmpDir.y * speed + 0.55 + Math.random() * 1.1,
+        this.tmpDir.z * speed + (Math.random() - 0.5) * speed * spread
+      );
+      this.tmpPos.copy(origin).addScaledVector(this.tmpDir, 0.25 + i * 0.28);
+      const colorHex = i === 0 ? 0xffc642 : 0xff6218;
+      this.spawnSprite(
+        this.tmpPos,
+        this.tmpVel,
+        colorHex,
+        0.34 + i * 0.1,
+        1.25 + Math.random() * 0.45,
+        0.34 + Math.random() * 0.14,
+        0.92,
+        -1.5,
+        true
+      );
+    }
+
+    // Warm dark smoke wisp
+    if (Math.random() < 0.5) {
+      const speed = 7.2 + Math.random() * 2.5;
+      this.tmpVel.set(
+        this.tmpDir.x * speed + (Math.random() - 0.5) * 1.5,
+        1.5 + Math.random() * 1.4,
+        this.tmpDir.z * speed + (Math.random() - 0.5) * 1.5
+      );
+      this.tmpPos.copy(origin).addScaledVector(this.tmpDir, 0.9);
+      this.spawnSprite(
+        this.tmpPos,
+        this.tmpVel,
+        0x2e2521,
+        0.48,
+        1.85,
+        0.65 + Math.random() * 0.25,
+        0.52,
+        -1.2,
+        false
+      );
+    }
+  }
+
   private spawnDustCloud(
     pos: THREE.Vector3,
     count: number,

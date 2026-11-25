@@ -10,12 +10,12 @@ import {
 } from '../types';
 import { getProceduralTextures } from '../engine/Textures';
 
-const WORLD_WIDTH = 110;
-const WORLD_DEPTH = 120;
-const SEG_X = 110;
-const SEG_Z = 120;
-const MAX_CRATERS = 70;
-const MAX_TRENCH_COLLAPSES = 35;
+const WORLD_WIDTH = 170;
+const WORLD_DEPTH = 190;
+const SEG_X = 150;
+const SEG_Z = 170;
+const MAX_CRATERS = 95;
+const MAX_TRENCH_COLLAPSES = 45;
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
@@ -72,6 +72,7 @@ export class Terrain {
     this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
     const tex = getProceduralTextures().mud;
+    tex.repeat.set(30, 34);
     const mat = new THREE.MeshStandardMaterial({
       map: tex,
       vertexColors: true,
@@ -120,7 +121,8 @@ export class Terrain {
     }
     for (const tr of this.trenches) {
       const res = distToSegmentSq(x, z, tr.x1, tr.z1, tr.x2, tr.z2);
-      if (Math.sqrt(res.distSq) <= tr.width * 0.55) {
+      const r = tr.width * 0.55;
+      if (res.distSq <= r * r) {
         return true;
       }
     }
@@ -211,16 +213,19 @@ export class Terrain {
     // 1. Trenches
     let trenchOffset = 0;
     let parapetOffset = 0;
-    for (const tr of this.trenches) {
-      const seg = distToSegmentSq(x, z, tr.x1, tr.z1, tr.x2, tr.z2);
-      const dist = Math.sqrt(seg.distSq);
+    for (let i = 0; i < this.trenches.length; i++) {
+      const tr = this.trenches[i];
       const halfW = tr.width * 0.5;
       const wallMargin = 0.42;
+      const maxOuter = tr.parapetSide !== 'none' ? halfW + 1.55 : halfW + wallMargin;
+      const seg = distToSegmentSq(x, z, tr.x1, tr.z1, tr.x2, tr.z2);
+      if (seg.distSq >= maxOuter * maxOuter) continue;
 
+      const dist = Math.sqrt(seg.distSq);
       if (dist < halfW + wallMargin) {
         const carve = 1 - smoothstep(halfW - 0.15, halfW + wallMargin, dist);
         trenchOffset = Math.min(trenchOffset, -tr.depth * carve);
-      } else if (tr.parapetSide !== 'none' && dist < halfW + 1.55) {
+      } else if (tr.parapetSide !== 'none') {
         // Raised dirt parapet on front edge
         const isNorthOfTrench = z < seg.cz;
         const matchSide =
@@ -272,13 +277,15 @@ export class Terrain {
     y += parapetOffset + trenchOffset;
 
     // 3. Ramps smoothly bridge trench floor up to ground level
-    for (const r of this.ramps) {
-      const seg = distToSegmentSq(x, z, r.x1, r.z1, r.x2, r.z2);
-      const dist = Math.sqrt(seg.distSq);
+    for (let i = 0; i < this.ramps.length; i++) {
+      const r = this.ramps[i];
       const halfW = r.width * 0.5;
-      if (dist <= halfW + 0.35) {
+      const maxOuter = halfW + 0.35;
+      const seg = distToSegmentSq(x, z, r.x1, r.z1, r.x2, r.z2);
+      if (seg.distSq <= maxOuter * maxOuter) {
+        const dist = Math.sqrt(seg.distSq);
         const rampY = THREE.MathUtils.lerp(r.y1, r.y2, seg.t);
-        const blend = 1 - smoothstep(halfW - 0.1, halfW + 0.35, dist);
+        const blend = 1 - smoothstep(halfW - 0.1, maxOuter, dist);
         y = THREE.MathUtils.lerp(y, rampY, blend);
       }
     }
@@ -374,6 +381,7 @@ export class Terrain {
   private rebuildAllVertices(): void {
     const pos = this.geometry.attributes.position as THREE.BufferAttribute;
     const col = this.geometry.attributes.color as THREE.BufferAttribute;
+    const craterCount = this.craters.length;
 
     for (let i = 0; i < pos.count; i++) {
       const vx = pos.getX(i);
@@ -387,10 +395,14 @@ export class Terrain {
       } else if (y > 0.14) {
         shade = 0.94;
       }
-      for (const c of this.craters) {
-        const d = Math.hypot(vx - c.x, vz - c.z);
-        if (d < c.radius * 1.1) {
-          shade = Math.min(shade, 0.45 + 0.35 * (d / (c.radius * 1.1)));
+      for (let ci = 0; ci < craterCount; ci++) {
+        const c = this.craters[ci];
+        const rShade = c.radius * 1.1;
+        const dx = vx - c.x;
+        const dz = vz - c.z;
+        const dSq = dx * dx + dz * dz;
+        if (dSq < rShade * rShade) {
+          shade = Math.min(shade, 0.45 + 0.35 * (Math.sqrt(dSq) / rShade));
         }
       }
       col.setXYZ(i, shade, shade * 0.96, shade * 0.91);

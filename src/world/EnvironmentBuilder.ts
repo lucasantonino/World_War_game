@@ -31,6 +31,7 @@ export class EnvironmentBuilder {
     }
   >();
   private disposableTextures: THREE.Texture[] = [];
+  private destructibleStageHandlers = new Map<string, (stage: DestructionStage) => void>();
   private timberMat: THREE.Material | null = null;
   private mudCollapseMat: THREE.Material | null = null;
   private bunkerMainGroup: THREE.Group | null = null;
@@ -71,6 +72,7 @@ export class EnvironmentBuilder {
     this.mgBarrelMeshes.clear();
     this.trenchStakes = [];
     this.dugoutVisuals.clear();
+    this.destructibleStageHandlers.clear();
     this.bunkerMainGroup = null;
     this.sunLight = null;
     this.hemiLight = null;
@@ -138,11 +140,11 @@ export class EnvironmentBuilder {
       const mapSize = quality === 'high' ? 2048 : 1024;
       this.sunLight.shadow.mapSize.set(mapSize, mapSize);
       this.sunLight.shadow.camera.near = 5;
-      this.sunLight.shadow.camera.far = 145;
-      this.sunLight.shadow.camera.left = -56;
-      this.sunLight.shadow.camera.right = 56;
-      this.sunLight.shadow.camera.top = 56;
-      this.sunLight.shadow.camera.bottom = -56;
+      this.sunLight.shadow.camera.far = 195;
+      this.sunLight.shadow.camera.left = -84;
+      this.sunLight.shadow.camera.right = 84;
+      this.sunLight.shadow.camera.top = 84;
+      this.sunLight.shadow.camera.bottom = -84;
       this.sunLight.shadow.bias = -0.0008;
     }
     this.rootGroup.add(this.sunLight);
@@ -187,12 +189,16 @@ export class EnvironmentBuilder {
     // 1b. Reflective mud puddles in trench floors & craters (no extra PointLights)
     this.buildMudPuddles(config);
 
+    // 1c. Packed-earth flank trails / dirt roads for reinforcement vehicles (no extra PointLights)
+    this.buildDirtRoads(config, tex.mud);
+
     // 2. Dugouts (safe overhead shelters with warm lantern light)
     this.buildDugouts(config, timberMat, sandbagMat);
 
-    // 3. Ruins & Bombed Buildings (3-stage destructibles)
+    // 3. Ruins & Enterable/Bombed Buildings (3-stage destructibles + tactical cover nodes)
     this.buildRuins(config, concreteMat);
-    this.buildBuildings(config, concreteMat, timberMat, darkWindowMat);
+    this.buildBuildings(config, concreteMat, timberMat, sandbagMat, steelMat, darkWindowMat);
+    this.registerCraterTacticalNodes(config);
 
     // 4. Destructible Trees & Fences
     this.buildTrees(config, timberMat);
@@ -224,12 +230,12 @@ export class EnvironmentBuilder {
       this.buildFlares(env.isNight);
     }
     if (env.hasSearchlights) {
-      this.buildSearchlights();
+      this.buildSearchlights(config);
     }
   }
 
   private buildSkyDome(topHex: number, horizonHex: number, isNight: boolean): void {
-    const geo = new THREE.SphereGeometry(170, 24, 16);
+    const geo = new THREE.SphereGeometry(215, 24, 16);
     this.skyUniforms = {
       uTop: { value: new THREE.Color(topHex) },
       uHorizon: { value: new THREE.Color(horizonHex) },
@@ -295,7 +301,7 @@ export class EnvironmentBuilder {
       blending: THREE.AdditiveBlending
     });
     this.horizonFlashMesh = new THREE.Mesh(new THREE.PlaneGeometry(44, 24), mat);
-    this.horizonFlashMesh.position.set(0, 8, -125);
+    this.horizonFlashMesh.position.set(0, 8, -155);
     this.horizonFlashMesh.visible = false;
     this.rootGroup.add(this.horizonFlashMesh);
   }
@@ -495,8 +501,9 @@ export class EnvironmentBuilder {
           bagGroup.add(rubbleGroup);
           this.rootGroup.add(bagGroup);
 
+          const bagId = `sandbag_${bagCounter++}`;
           const spec: DestructibleSpec = {
-            id: `sandbag_${bagCounter++}`,
+            id: bagId,
             kind: 'sandbag',
             x: bx,
             y: by - 0.1,
@@ -520,6 +527,21 @@ export class EnvironmentBuilder {
               rubbleGroup.visible = true;
             }
           });
+
+          if (i % 2 === 0) {
+            const coverOffsetZ = tr.parapetSide === 'north' ? 1.15 : -1.15;
+            const nodeZ = bz + coverOffsetZ;
+            const nodeY = this.terrain.getTerrainHeight(bx, nodeZ);
+            this.cover.registerTacticalNode({
+              id: `sandbag_node_${bagId}`,
+              x: bx,
+              y: nodeY,
+              z: nodeZ,
+              radius: 1.15,
+              insideBuilding: false,
+              windowDirZ: tr.parapetSide === 'north' ? -1 : 1
+            });
+          }
         }
       }
     }
@@ -571,6 +593,88 @@ export class EnvironmentBuilder {
         puddle.rotation.y = angle + (i % 2 ? 0.15 : -0.12);
         puddle.receiveShadow = true;
         this.rootGroup.add(puddle);
+      }
+    }
+  }
+
+  private buildDirtRoads(config: MissionConfig, mudTex: THREE.Texture): void {
+    const roadMat = new THREE.MeshStandardMaterial({
+      map: mudTex,
+      color: 0x4b3d2f,
+      roughness: 0.97,
+      metalness: 0.02
+    });
+    const rutMat = new THREE.MeshStandardMaterial({
+      color: 0x2e251c,
+      roughness: 0.98,
+      metalness: 0.01
+    });
+
+    const addRoadStrip = (x1: number, z1: number, x2: number, z2: number, width: number) => {
+      const dx = x2 - x1;
+      const dz = z2 - z1;
+      const len = Math.hypot(dx, dz);
+      if (len < 2) return;
+      const steps = Math.max(2, Math.floor(len / 4.2));
+      const segLen = len / steps;
+      const yaw = Math.atan2(dx, dz);
+      const perpX = Math.cos(yaw);
+      const perpZ = -Math.sin(yaw);
+
+      const slabGeo = new THREE.BoxGeometry(width, 0.04, segLen + 0.35);
+      const rutGeo = new THREE.BoxGeometry(0.42, 0.05, segLen + 0.32);
+
+      for (let i = 0; i < steps; i++) {
+        const t = (i + 0.5) / steps;
+        const px = x1 + dx * t;
+        const pz = z1 + dz * t;
+        if (this.terrain.isInsideTrenchOrDugout(px, pz)) continue;
+
+        let blockedByBuilding = false;
+        for (const b of config.buildings ?? []) {
+          if (Math.hypot(px - b.x, pz - b.z) < Math.max(b.w, b.d) * 0.65) {
+            blockedByBuilding = true;
+            break;
+          }
+        }
+        if (blockedByBuilding) continue;
+
+        const py = this.terrain.getTerrainHeight(px, pz);
+        const ny = this.terrain.getTerrainHeight(px + (dx / len) * 1.4, pz + (dz / len) * 1.4);
+        const by = this.terrain.getTerrainHeight(px - (dx / len) * 1.4, pz - (dz / len) * 1.4);
+        const pitch = Math.atan2(by - ny, 2.8);
+
+        const slab = new THREE.Mesh(slabGeo, roadMat);
+        slab.position.set(px, py + 0.018, pz);
+        slab.rotation.set(pitch, yaw, 0);
+        slab.receiveShadow = true;
+        this.rootGroup.add(slab);
+
+        for (const side of [-1, 1]) {
+          const rx = px + perpX * (width * 0.28) * side;
+          const rz = pz + perpZ * (width * 0.28) * side;
+          const rut = new THREE.Mesh(rutGeo, rutMat);
+          rut.position.set(rx, py + 0.022, rz);
+          rut.rotation.set(pitch, yaw, 0);
+          rut.receiveShadow = true;
+          this.rootGroup.add(rut);
+        }
+      }
+    };
+
+    // Subtle flank dirt tracks for troop carrier approach
+    addRoadStrip(-56, -84, -48, 28, 3.6);
+    addRoadStrip(56, -84, 48, 28, 3.6);
+
+    // Additional paths derived from troopCarsToSpawn routes in mission phases
+    const seenRoutes = new Set<string>();
+    for (const ph of config.phases) {
+      if (!ph.troopCarsToSpawn) continue;
+      for (const car of ph.troopCarsToSpawn) {
+        const key = `${Math.round(car.x / 6)}_${Math.round(car.dropX / 6)}_${Math.round(car.dropZ / 10)}`;
+        if (seenRoutes.has(key)) continue;
+        seenRoutes.add(key);
+        addRoadStrip(car.x, car.z, car.dropX, car.dropZ, 3.4);
       }
     }
   }
@@ -813,8 +917,9 @@ export class EnvironmentBuilder {
       group.add(rubbleBase);
       this.rootGroup.add(group);
 
+      const ruinId = `ruin_${i}`;
       const spec: DestructibleSpec = {
-        id: `ruin_${i}`,
+        id: ruinId,
         kind: 'ruin',
         x: r.x,
         y: baseY,
@@ -839,6 +944,40 @@ export class EnvironmentBuilder {
           rubbleBase.visible = true;
         }
       });
+
+      const cosR = Math.cos(r.rotY);
+      const sinR = Math.sin(r.rotY);
+      const localOffZ = r.d * 0.5 + 0.95;
+      for (const dirZ of [1, -1]) {
+        const wx = r.x + localOffZ * dirZ * sinR;
+        const wz = r.z + localOffZ * dirZ * cosR;
+        const wy = this.terrain.getTerrainHeight(wx, wz);
+        this.cover.registerTacticalNode({
+          id: `${ruinId}_node_${dirZ > 0 ? 's' : 'n'}`,
+          x: wx,
+          y: wy,
+          z: wz,
+          radius: 1.2,
+          insideBuilding: false,
+          windowDirZ: -dirZ * cosR
+        });
+      }
+    }
+  }
+
+  private registerCraterTacticalNodes(config: MissionConfig): void {
+    for (let i = 0; i < config.initialCraters.length; i++) {
+      const c = config.initialCraters[i];
+      if (c.radius < 2.4) continue;
+      const cy = this.terrain.getTerrainHeight(c.x, c.z);
+      this.cover.registerTacticalNode({
+        id: `crater_node_${i}`,
+        x: c.x,
+        y: cy,
+        z: c.z,
+        radius: Math.max(1.1, c.radius * 0.52),
+        insideBuilding: false
+      });
     }
   }
 
@@ -846,130 +985,354 @@ export class EnvironmentBuilder {
     config: MissionConfig,
     concreteMat: THREE.Material,
     timberMat: THREE.Material,
+    sandbagMat: THREE.Material,
+    steelMat: THREE.Material,
     darkWindowMat: THREE.Material
   ): void {
     const buildings = config.buildings ?? [];
     for (let i = 0; i < buildings.length; i++) {
       const b = buildings[i];
+      const buildingId = `building_${i}`;
       const baseY = this.terrain.getTerrainHeight(b.x, b.z);
       const group = new THREE.Group();
       group.position.set(b.x, baseY, b.z);
       group.rotation.y = b.rotY;
 
       const wallT = 0.34;
-      const midH = b.h * 0.54;
-      const topH = b.h - midH;
+      const isEnterable = b.enterable !== false;
+      const kind = b.kind ?? 'house';
+      const cosR = Math.cos(b.rotY);
+      const sinR = Math.sin(b.rotY);
+      const absCos = Math.abs(cosR);
+      const absSin = Math.abs(sinR);
+
+      if (!isEnterable) {
+        const midH = b.h * 0.54;
+        const topH = b.h - midH;
+
+        const midSection = new THREE.Group();
+        for (const zSide of [-1, 1]) {
+          const wall = new THREE.Mesh(new THREE.BoxGeometry(b.w, midH, wallT), concreteMat);
+          wall.position.set(0, midH * 0.5, zSide * (b.d * 0.5 - wallT * 0.5));
+          wall.castShadow = true;
+          wall.receiveShadow = true;
+          midSection.add(wall);
+
+          for (const wx of [-b.w * 0.28, b.w * 0.28]) {
+            const win = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.72, wallT + 0.05), darkWindowMat);
+            win.position.set(wx, midH * 0.56, zSide * (b.d * 0.5 - wallT * 0.5));
+            midSection.add(win);
+          }
+        }
+        for (const xSide of [-1, 1]) {
+          const sideWall = new THREE.Mesh(new THREE.BoxGeometry(wallT, midH, b.d - wallT * 2), concreteMat);
+          sideWall.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.5, 0);
+          sideWall.castShadow = true;
+          sideWall.receiveShadow = true;
+          midSection.add(sideWall);
+
+          const sideWin = new THREE.Mesh(new THREE.BoxGeometry(wallT + 0.05, 0.72, 0.85), darkWindowMat);
+          sideWin.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.56, 0);
+          midSection.add(sideWin);
+        }
+
+        const topSection = new THREE.Group();
+        const upperFront = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.88, topH, wallT), concreteMat);
+        upperFront.position.set(-b.w * 0.04, midH + topH * 0.5, -(b.d * 0.5 - wallT * 0.5));
+        upperFront.castShadow = true;
+        upperFront.receiveShadow = true;
+        topSection.add(upperFront);
+
+        const upperBack = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.72, topH * 0.85, wallT), concreteMat);
+        upperBack.position.set(b.w * 0.1, midH + topH * 0.42, b.d * 0.5 - wallT * 0.5);
+        upperBack.castShadow = true;
+        upperBack.receiveShadow = true;
+        topSection.add(upperBack);
+
+        for (const xSide of [-1, 1]) {
+          const uSide = new THREE.Mesh(
+            new THREE.BoxGeometry(wallT, topH * 0.75, b.d * 0.65),
+            concreteMat
+          );
+          uSide.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH + topH * 0.37, -b.d * 0.12);
+          uSide.castShadow = true;
+          topSection.add(uSide);
+        }
+
+        const rubbleBase = this.buildBuildingRubble(b.w, b.d, concreteMat, timberMat);
+        group.add(midSection, topSection, rubbleBase);
+        this.rootGroup.add(group);
+
+        const spec: DestructibleSpec = {
+          id: buildingId,
+          kind: 'building',
+          x: b.x,
+          y: baseY,
+          z: b.z,
+          width: b.w,
+          height: b.h,
+          depth: b.d,
+          hp: 380,
+          maxHp: 380,
+          blocksBullets: true,
+          blocksMovement: true,
+          blocksSight: true,
+          rotationY: b.rotY
+        };
+        const applyStage = (stage: DestructionStage) => {
+          if (stage === 1) {
+            topSection.visible = false;
+            midSection.rotation.z = 0.06;
+          } else if (stage === 2) {
+            topSection.visible = false;
+            midSection.visible = false;
+            rubbleBase.visible = true;
+          }
+        };
+        this.destructibleStageHandlers.set(buildingId, applyStage);
+        this.cover.registerDestructible(spec, group, applyStage);
+        continue;
+      }
+
+      // Enterable hollow structure ('house' | 'shed' | 'outpost')
+      const wallMat = kind === 'shed' ? timberMat : concreteMat;
+      const roofMat = kind === 'shed' ? steelMat : timberMat;
+      const sillMat = kind === 'outpost' ? sandbagMat : wallMat;
+
+      const doorW = Math.max(1.65, Math.min(2.05, b.w * 0.34));
+      const sillH = 1.04;
+      const doorH = 2.05;
+      const lintelH = Math.max(0.24, Math.min(0.32, b.h - doorH));
+      const lintelTopY = doorH + lintelH;
+      const upperH = Math.max(0.45, b.h - lintelTopY);
 
       const midSection = new THREE.Group();
-      // Front and back lower masonry walls
-      for (const zSide of [-1, 1]) {
-        const wall = new THREE.Mesh(new THREE.BoxGeometry(b.w, midH, wallT), concreteMat);
-        wall.position.set(0, midH * 0.5, zSide * (b.d * 0.5 - wallT * 0.5));
-        wall.castShadow = true;
-        wall.receiveShadow = true;
-        midSection.add(wall);
-
-        // Dark windows on front/back lower walls
-        for (const wx of [-b.w * 0.28, b.w * 0.28]) {
-          const win = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.72, wallT + 0.05), darkWindowMat);
-          win.position.set(wx, midH * 0.56, zSide * (b.d * 0.5 - wallT * 0.5));
-          midSection.add(win);
-        }
-      }
-      // Side lower masonry walls + dark windows
-      for (const xSide of [-1, 1]) {
-        const sideWall = new THREE.Mesh(new THREE.BoxGeometry(wallT, midH, b.d - wallT * 2), concreteMat);
-        sideWall.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.5, 0);
-        sideWall.castShadow = true;
-        sideWall.receiveShadow = true;
-        midSection.add(sideWall);
-
-        const sideWin = new THREE.Mesh(new THREE.BoxGeometry(wallT + 0.05, 0.72, 0.85), darkWindowMat);
-        sideWin.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH * 0.56, 0);
-        midSection.add(sideWin);
-      }
-
       const topSection = new THREE.Group();
-      // Upper front/back broken masonry walls
-      const upperFront = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.88, topH, wallT), concreteMat);
-      upperFront.position.set(-b.w * 0.04, midH + topH * 0.5, -(b.d * 0.5 - wallT * 0.5));
-      upperFront.castShadow = true;
-      upperFront.receiveShadow = true;
-      topSection.add(upperFront);
+      let wallColIdx = 0;
 
-      const upperBack = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.72, topH * 0.85, wallT), concreteMat);
-      upperBack.position.set(b.w * 0.1, midH + topH * 0.42, b.d * 0.5 - wallT * 0.5);
-      upperBack.castShadow = true;
-      upperBack.receiveShadow = true;
-      topSection.add(upperBack);
+      const addWallPart = (
+        targetGroup: THREE.Group,
+        lx: number,
+        ly: number,
+        lz: number,
+        w: number,
+        h: number,
+        d: number,
+        mat: THREE.Material,
+        registerCollider = true,
+        blocksMovement = true,
+        blocksSight = true,
+        groundAnchored = false
+      ) => {
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+        mesh.position.set(lx, ly, lz);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        targetGroup.add(mesh);
 
-      // Upper dark windows
-      for (const wx of [-b.w * 0.24, b.w * 0.18]) {
-        const uWin = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.65, wallT + 0.05), darkWindowMat);
-        uWin.position.set(wx, midH + topH * 0.45, -(b.d * 0.5 - wallT * 0.5));
-        topSection.add(uWin);
+        if (!registerCollider) return;
+
+        const wx = b.x + lx * cosR + lz * sinR;
+        const wz = b.z - lx * sinR + lz * cosR;
+        const effW = w * absCos + d * absSin;
+        const effD = w * absSin + d * absCos;
+        const minY = groundAnchored ? baseY - 0.35 : baseY + (ly - h * 0.5);
+        const maxY = baseY + (ly + h * 0.5);
+
+        this.cover.addStaticBox({
+          id: `${buildingId}_wall_${wallColIdx++}`,
+          minX: wx - effW * 0.5,
+          maxX: wx + effW * 0.5,
+          minY,
+          maxY,
+          minZ: wz - effD * 0.5,
+          maxZ: wz + effD * 0.5,
+          blocksBullets: true,
+          blocksMovement,
+          blocksSight,
+          destructibleId: buildingId,
+          rotY: Math.abs(b.rotY) > 1e-4 ? b.rotY : undefined,
+          cx: wx,
+          cz: wz,
+          halfW: w * 0.5,
+          halfD: d * 0.5
+        });
+      };
+
+      // Interior floor slab (top at baseY + 0.04, extending downward so corners never float)
+      const floorSlab = new THREE.Mesh(
+        new THREE.BoxGeometry(b.w - 0.16, 0.34, b.d - 0.16),
+        kind === 'outpost' ? concreteMat : timberMat
+      );
+      floorSlab.position.set(0, -0.13, 0);
+      floorSlab.receiveShadow = true;
+      midSection.add(floorSlab);
+
+      // North (-Z) and South (+Z) walls with centered open doorway (>= 1.65m) and firing windows
+      const wingW = (b.w - doorW) * 0.5;
+      for (const zSide of [-1, 1]) {
+        const wallZ = zSide * (b.d * 0.5 - wallT * 0.5);
+
+        for (const xSide of [-1, 1]) {
+          if (wingW >= 1.35) {
+            const pierW = Math.max(0.32, Math.min(0.46, wingW * 0.24));
+            const winW = wingW - pierW * 2;
+            const outerPierX = xSide * (b.w * 0.5 - pierW * 0.5);
+            const jambPierX = xSide * (doorW * 0.5 + pierW * 0.5);
+            const winCenterX = xSide * (doorW * 0.5 + wingW * 0.5);
+
+            addWallPart(midSection, outerPierX, doorH * 0.5, wallZ, pierW, doorH, wallT, wallMat, true, true, true, true);
+            addWallPart(midSection, jambPierX, doorH * 0.5, wallZ, pierW, doorH, wallT, wallMat, true, true, true, true);
+            addWallPart(midSection, winCenterX, sillH * 0.5, wallZ, winW, sillH, wallT, sillMat, true, true, true, true);
+
+            // Visual timber window sill trim
+            addWallPart(midSection, winCenterX, sillH + 0.025, wallZ, winW + 0.04, 0.05, wallT + 0.04, timberMat, false);
+          } else {
+            const wingCenterX = xSide * (doorW * 0.5 + wingW * 0.5);
+            addWallPart(midSection, wingCenterX, doorH * 0.5, wallZ, wingW, doorH, wallT, wallMat, true, true, true, true);
+          }
+        }
+
+        // Door/window header lintel beam above y = 2.05m
+        addWallPart(
+          midSection,
+          0,
+          doorH + lintelH * 0.5,
+          wallZ,
+          b.w,
+          lintelH,
+          wallT,
+          kind === 'shed' ? timberMat : wallMat,
+          true,
+          true,
+          true,
+          false
+        );
+
+        // Upper wall section (breaks off in Stage 1)
+        addWallPart(
+          topSection,
+          0,
+          lintelTopY + upperH * 0.5,
+          wallZ,
+          b.w * 0.94,
+          upperH,
+          wallT,
+          wallMat,
+          true,
+          true,
+          true,
+          false
+        );
       }
 
-      // Side upper walls (partially collapsed)
+      // West (-X) and East (+X) walls with real center firing windows (1.04m sill)
+      const sideLen = Math.max(1.8, b.d - wallT * 2);
+      const sideWinW = Math.max(0.95, Math.min(1.65, sideLen * 0.42));
+      const sidePierD = Math.max(0.35, (sideLen - sideWinW) * 0.5);
       for (const xSide of [-1, 1]) {
-        const uSide = new THREE.Mesh(
-          new THREE.BoxGeometry(wallT, topH * 0.75, b.d * 0.65),
-          concreteMat
+        const wallX = xSide * (b.w * 0.5 - wallT * 0.5);
+
+        for (const zPierSide of [-1, 1]) {
+          const pierZ = zPierSide * (sideWinW * 0.5 + sidePierD * 0.5);
+          addWallPart(midSection, wallX, doorH * 0.5, pierZ, wallT, doorH, sidePierD, wallMat, true, true, true, true);
+        }
+        addWallPart(midSection, wallX, sillH * 0.5, 0, wallT, sillH, sideWinW, sillMat, true, true, true, true);
+        addWallPart(midSection, wallX, sillH + 0.025, 0, wallT + 0.04, 0.05, sideWinW + 0.04, timberMat, false);
+
+        // Side header lintel above y = 2.05m
+        addWallPart(midSection, wallX, doorH + lintelH * 0.5, 0, wallT, lintelH, sideLen, wallMat, true, true, true, false);
+
+        // Upper side wall (breaks off in Stage 1)
+        addWallPart(
+          topSection,
+          wallX,
+          lintelTopY + upperH * 0.5,
+          0,
+          wallT,
+          upperH,
+          sideLen * 0.85,
+          wallMat,
+          true,
+          true,
+          true,
+          false
         );
-        uSide.position.set(xSide * (b.w * 0.5 - wallT * 0.5), midH + topH * 0.37, -b.d * 0.12);
-        uSide.castShadow = true;
-        topSection.add(uSide);
       }
 
-      // Charred wooden roof beams & tilted rafters
+      // Roof beams & overhead shelter deck (falls in Stage 1)
       for (let r = -1; r <= 1; r++) {
-        const beam = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, b.d + 0.25), timberMat);
-        beam.position.set(r * (b.w * 0.32), b.h - 0.05, 0);
-        beam.rotation.z = r * 0.08;
-        beam.rotation.x = r === 0 ? 0.12 : -0.06;
-        beam.castShadow = true;
-        topSection.add(beam);
+        addWallPart(topSection, r * (b.w * 0.3), b.h - 0.06, 0, 0.16, 0.16, b.d + 0.24, timberMat, false);
       }
-      const ridgeBeam = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.96, 0.18, 0.18), timberMat);
-      ridgeBeam.position.set(0, b.h + 0.12, 0);
-      ridgeBeam.rotation.z = -0.04;
-      ridgeBeam.castShadow = true;
-      topSection.add(ridgeBeam);
+      addWallPart(topSection, -b.w * 0.24, b.h + 0.06, 0, b.w * 0.48, 0.12, b.d + 0.18, roofMat, false);
+      addWallPart(topSection, b.w * 0.24, b.h + 0.06, -b.d * 0.06, b.w * 0.46, 0.12, b.d * 0.88, roofMat, false);
 
-      // Stage 2 rubble base
-      const rubbleBase = new THREE.Group();
-      rubbleBase.visible = false;
-      const foundation = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.96, 0.34, b.d * 0.96), concreteMat);
-      foundation.position.y = 0.17;
-      foundation.receiveShadow = true;
-      rubbleBase.add(foundation);
+      // Roof collider (protects against overhead hits until Stage 1)
+      this.cover.addStaticBox({
+        id: `${buildingId}_wall_roof`,
+        minX: b.x - (b.w * absCos + b.d * absSin) * 0.5,
+        maxX: b.x + (b.w * absCos + b.d * absSin) * 0.5,
+        minY: baseY + b.h - 0.12,
+        maxY: baseY + b.h + 0.28,
+        minZ: b.z - (b.w * absSin + b.d * absCos) * 0.5,
+        maxZ: b.z + (b.w * absSin + b.d * absCos) * 0.5,
+        blocksBullets: true,
+        blocksMovement: false,
+        blocksSight: true,
+        destructibleId: buildingId,
+        rotY: Math.abs(b.rotY) > 1e-4 ? b.rotY : undefined,
+        cx: b.x,
+        cz: b.z,
+        halfW: b.w * 0.5,
+        halfD: b.d * 0.5
+      });
 
-      for (let c = 0; c < 6; c++) {
-        const masonry = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.32, 0.72), concreteMat);
-        masonry.position.set(
-          ((c % 3) - 1) * (b.w * 0.28),
-          0.34 + (c % 2) * 0.12,
-          (c < 3 ? -1 : 1) * (b.d * 0.22)
-        );
-        masonry.rotation.set(0.2 * (c % 2 ? 1 : -1), c * 0.55, 0.18);
-        masonry.castShadow = true;
-        rubbleBase.add(masonry);
-      }
-      for (let t = 0; t < 2; t++) {
-        const fallenBeam = new THREE.Mesh(new THREE.BoxGeometry(b.w * 0.72, 0.14, 0.16), timberMat);
-        fallenBeam.position.set((t === 0 ? -0.4 : 0.4), 0.44, (t === 0 ? -0.35 : 0.45));
-        fallenBeam.rotation.set(0.12, 0.4 + t * 0.9, 0.22);
-        fallenBeam.castShadow = true;
-        rubbleBase.add(fallenBeam);
-      }
-
-      group.add(midSection);
-      group.add(topSection);
-      group.add(rubbleBase);
+      const rubbleBase = this.buildBuildingRubble(b.w, b.d, concreteMat, timberMat);
+      group.add(midSection, topSection, rubbleBase);
       this.rootGroup.add(group);
 
+      // Register enterable bounds (interior floor area inside walls)
+      const innerHalfW = Math.max(0.8, b.w * 0.5 - wallT * 0.8);
+      const innerHalfD = Math.max(0.8, b.d * 0.5 - wallT * 0.8);
+      this.cover.registerEnterableBuildingBounds(
+        buildingId,
+        b.x - innerHalfW,
+        b.x + innerHalfW,
+        b.z - innerHalfD,
+        b.z + innerHalfD,
+        baseY + b.h,
+        b.rotY
+      );
+
+      // Register 3-4 TacticalCoverNodes inside at the firing windows
+      const nodeOffX = Math.max(1.15, doorW * 0.5 + wingW * 0.5);
+      const nodeOffZ = Math.max(0.85, b.d * 0.5 - wallT - 0.72);
+      const localNodes: Array<{ id: string; lx: number; lz: number; dirZ: number }> = [
+        { id: `${buildingId}_node_nw`, lx: -nodeOffX, lz: -nodeOffZ, dirZ: -1 },
+        { id: `${buildingId}_node_ne`, lx: nodeOffX, lz: -nodeOffZ, dirZ: -1 },
+        { id: `${buildingId}_node_sw`, lx: -nodeOffX, lz: nodeOffZ, dirZ: 1 }
+      ];
+      if (b.w >= 5.0) {
+        localNodes.push({ id: `${buildingId}_node_se`, lx: nodeOffX, lz: nodeOffZ, dirZ: 1 });
+      }
+      for (const ln of localNodes) {
+        const wx = b.x + ln.lx * cosR + ln.lz * sinR;
+        const wz = b.z - ln.lx * sinR + ln.lz * cosR;
+        const wy = this.terrain.getTerrainHeight(wx, wz);
+        this.cover.registerTacticalNode({
+          id: ln.id,
+          x: wx,
+          y: wy,
+          z: wz,
+          radius: 1.1,
+          insideBuilding: true,
+          buildingId,
+          windowDirZ: ln.dirZ * cosR
+        });
+      }
+
       const spec: DestructibleSpec = {
-        id: `building_${i}`,
+        id: buildingId,
         kind: 'building',
         x: b.x,
         y: baseY,
@@ -977,23 +1340,73 @@ export class EnvironmentBuilder {
         width: b.w,
         height: b.h,
         depth: b.d,
-        hp: 380,
-        maxHp: 380,
-        blocksBullets: true,
-        blocksMovement: true,
-        blocksSight: true,
+        hp: 420,
+        maxHp: 420,
+        blocksBullets: false,
+        blocksMovement: false,
+        blocksSight: false,
         rotationY: b.rotY
       };
-      this.cover.registerDestructible(spec, group, (stage: DestructionStage) => {
+      const applyStage = (stage: DestructionStage) => {
         if (stage === 1) {
           topSection.visible = false;
-          midSection.rotation.z = 0.06;
+          midSection.rotation.z = 0.04;
         } else if (stage === 2) {
           topSection.visible = false;
           midSection.visible = false;
           rubbleBase.visible = true;
+          this.cover.removeStaticCollidersByPrefix(buildingId);
+          this.cover.removeEnterableBuildingBounds(buildingId);
+          this.cover.removeNodesForBuilding(buildingId);
         }
-      });
+      };
+      this.destructibleStageHandlers.set(buildingId, applyStage);
+      this.cover.registerDestructible(spec, group, applyStage);
+    }
+  }
+
+  private buildBuildingRubble(
+    w: number,
+    d: number,
+    concreteMat: THREE.Material,
+    timberMat: THREE.Material
+  ): THREE.Group {
+    const rubbleBase = new THREE.Group();
+    rubbleBase.visible = false;
+    const foundation = new THREE.Mesh(new THREE.BoxGeometry(w * 0.96, 0.34, d * 0.96), concreteMat);
+    foundation.position.y = 0.17;
+    foundation.receiveShadow = true;
+    rubbleBase.add(foundation);
+
+    for (let c = 0; c < 6; c++) {
+      const masonry = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.32, 0.72), concreteMat);
+      masonry.position.set(
+        ((c % 3) - 1) * (w * 0.28),
+        0.34 + (c % 2) * 0.12,
+        (c < 3 ? -1 : 1) * (d * 0.22)
+      );
+      masonry.rotation.set(0.2 * (c % 2 ? 1 : -1), c * 0.55, 0.18);
+      masonry.castShadow = true;
+      rubbleBase.add(masonry);
+    }
+    for (let t = 0; t < 2; t++) {
+      const fallenBeam = new THREE.Mesh(new THREE.BoxGeometry(w * 0.72, 0.14, 0.16), timberMat);
+      fallenBeam.position.set(t === 0 ? -0.4 : 0.4, 0.44, t === 0 ? -0.35 : 0.45);
+      fallenBeam.rotation.set(0.12, 0.4 + t * 0.9, 0.22);
+      fallenBeam.castShadow = true;
+      rubbleBase.add(fallenBeam);
+    }
+    return rubbleBase;
+  }
+
+  public setDestructibleStage(id: string, stage: DestructionStage): void {
+    const handler = this.destructibleStageHandlers.get(id);
+    if (handler) {
+      handler(stage);
+    } else if (stage === 2 && id.startsWith('building_')) {
+      this.cover.removeStaticCollidersByPrefix(id);
+      this.cover.removeEnterableBuildingBounds(id);
+      this.cover.removeNodesForBuilding(id);
     }
   }
 
@@ -1658,9 +2071,9 @@ export class EnvironmentBuilder {
     const velocities = new Float32Array(count);
 
     for (let i = 0; i < count; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * 92;
+      positions[i * 3] = (Math.random() - 0.5) * 136;
       positions[i * 3 + 1] = Math.random() * 27;
-      positions[i * 3 + 2] = (Math.random() - 0.5) * 92;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * 136;
       velocities[i] = 0.78 + Math.random() * 0.44;
     }
 
@@ -1705,10 +2118,11 @@ export class EnvironmentBuilder {
     });
   }
 
-  private buildSearchlights(): void {
+  private buildSearchlights(config: MissionConfig): void {
+    const baseZ = config.bunkers.length > 0 ? config.bunkers[0].z - 4 : -48;
     for (const [sx, sz, phase] of [
-      [-18, -36, 0],
-      [18, -36, 2.1]
+      [-24, baseZ, 0],
+      [24, baseZ, 2.1]
     ]) {
       const coneGeo = new THREE.ConeGeometry(6.5, 42, 16, 1, true);
       coneGeo.translate(0, -21, 0);
@@ -1847,10 +2261,10 @@ export class EnvironmentBuilder {
           x += Math.sin(this.weatherElapsed * 1.3 + i * 0.7) * 0.45 * dt;
         }
         if (y < -1) y = 26;
-        if (x > 46) x -= 92;
-        else if (x < -46) x += 92;
-        if (z > 46) z -= 92;
-        else if (z < -46) z += 92;
+        if (x > 68) x -= 136;
+        else if (x < -68) x += 136;
+        if (z > 68) z -= 136;
+        else if (z < -68) z += 136;
 
         pos.setXYZ(i, x, y, z);
       }
@@ -1864,8 +2278,8 @@ export class EnvironmentBuilder {
     this.artilleryFlashTimer -= dt;
     if (this.artilleryFlashTimer <= 0) {
       this.artilleryFlashPulse = 0.85 + Math.random() * 0.35;
-      const flashX = (Math.random() - 0.5) * 150;
-      const flashZ = -115 - Math.random() * 25;
+      const flashX = (Math.random() - 0.5) * 180;
+      const flashZ = -140 - Math.random() * 25;
       const flashY = 7 + Math.random() * 8;
       if (this.skyUniforms) {
         this.skyUniforms.uFlashDir.value.set(flashX, flashY, flashZ).normalize();

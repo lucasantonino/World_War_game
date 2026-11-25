@@ -51,6 +51,7 @@ export interface ImpactCallbacks {
   onHitPlayer: (damage: number, origin: THREE.Vector3, cause: string, causeBleed: boolean) => void;
   onNearMissPlayer: (origin: THREE.Vector3) => void;
   onHitTank: (pos: THREE.Vector3, damage: number, isRocket: boolean) => boolean;
+  onHitAllyTank?: (pos: THREE.Vector3, damage: number, isRocket: boolean) => boolean;
   onExplosion: (
     center: THREE.Vector3,
     radius: number,
@@ -91,6 +92,16 @@ export class ProjectileSystem {
   private bombGeo = new THREE.CylinderGeometry(0.18, 0.24, 1.15, 8);
   private bombMat = new THREE.MeshStandardMaterial({ color: 0x262825, roughness: 0.6 });
   private tmpTrailVel = new THREE.Vector3(0, 0.35, 0);
+  private tmpRocketTrailVel = new THREE.Vector3(0, 0.3, 0);
+  private tmpPlayerHead = new THREE.Vector3();
+  private tmpDir = new THREE.Vector3();
+  private tmpNegDir = new THREE.Vector3();
+  private tmpNextPos = new THREE.Vector3();
+  private tmpSamplePos = new THREE.Vector3();
+  private tmpStep = new THREE.Vector3();
+  private tmpAB = new THREE.Vector3();
+  private tmpPA = new THREE.Vector3();
+  private tmpProj = new THREE.Vector3();
 
   constructor(
     scene: THREE.Scene,
@@ -144,7 +155,12 @@ export class ProjectileSystem {
     });
   }
 
-  public spawnRocket(origin: THREE.Vector3, dir: THREE.Vector3, faction: 'ally' | 'enemy'): void {
+  public spawnRocket(
+    origin: THREE.Vector3,
+    dir: THREE.Vector3,
+    faction: 'ally' | 'enemy',
+    speed = 44
+  ): void {
     const g = new THREE.Group();
     const body = new THREE.Mesh(
       new THREE.CylinderGeometry(0.055, 0.055, 0.55, 8),
@@ -160,13 +176,14 @@ export class ProjectileSystem {
     g.add(tip);
 
     g.position.copy(origin);
-    g.lookAt(origin.clone().add(dir));
+    this.tmpNextPos.copy(origin).add(dir);
+    g.lookAt(this.tmpNextPos);
     this.scene.add(g);
 
     this.rockets.push({
       mesh: g,
       pos: origin.clone(),
-      vel: dir.clone().normalize().multiplyScalar(44),
+      vel: dir.clone().normalize().multiplyScalar(speed),
       age: 0,
       faction
     });
@@ -273,7 +290,7 @@ export class ProjectileSystem {
     callbacks: ImpactCallbacks,
     bleedChanceMult = 1.0
   ): void {
-    const playerHead = new THREE.Vector3(playerPos.x, playerEyeY, playerPos.z);
+    this.tmpPlayerHead.set(playerPos.x, playerEyeY, playerPos.z);
 
     // 1. Bullets (sub-step raycasted)
     for (let i = this.tracers.length - 1; i >= 0; i--) {
@@ -286,12 +303,12 @@ export class ProjectileSystem {
       }
 
       const stepDist = t.vel.length() * dt;
-      const dir = t.vel.clone().normalize();
-      const nextPos = t.pos.clone().addScaledVector(dir, stepDist);
+      this.tmpDir.copy(t.vel).normalize();
+      this.tmpNextPos.copy(t.pos).addScaledVector(this.tmpDir, stepDist);
 
       // Whiz check for enemy bullets passing close to player
       if (t.faction === 'enemy' && !t.whizzed) {
-        const distToPlayer = this.pointSegmentDist(playerHead, t.pos, nextPos);
+        const distToPlayer = this.pointSegmentDist(this.tmpPlayerHead, t.pos, this.tmpNextPos);
         if (distToPlayer < 2.2) {
           t.whizzed = true;
           callbacks.onNearMissPlayer(t.pos);
@@ -302,23 +319,31 @@ export class ProjectileSystem {
       let consumed = false;
       const samples = 2;
       for (let s = 1; s <= samples; s++) {
-        const samplePos = t.pos.clone().lerp(nextPos, s / samples);
+        this.tmpSamplePos.copy(t.pos).lerp(this.tmpNextPos, s / samples);
         if (t.faction === 'ally') {
-          if (callbacks.onHitEnemySoldier(samplePos, dir, t.damage, true)) {
+          if (callbacks.onHitEnemySoldier(this.tmpSamplePos, this.tmpDir, t.damage, true)) {
             consumed = true;
             break;
           }
-          if (callbacks.onHitTank(samplePos, 0, false)) {
-            this.vfx.spawnBulletImpact(samplePos, dir.clone().negate(), true);
+          if (callbacks.onHitTank(this.tmpSamplePos, t.damage, false)) {
+            this.tmpNegDir.copy(this.tmpDir).negate();
+            this.vfx.spawnBulletImpact(this.tmpSamplePos, this.tmpNegDir, true);
             this.audio.playRicochet(0);
             consumed = true;
             break;
           }
         } else {
+          if (callbacks.onHitAllyTank?.(this.tmpSamplePos, t.damage, false)) {
+            this.tmpNegDir.copy(this.tmpDir).negate();
+            this.vfx.spawnBulletImpact(this.tmpSamplePos, this.tmpNegDir, true);
+            this.audio.playRicochet(0);
+            consumed = true;
+            break;
+          }
           // Enemy bullet hitting player
-          const playerHitDist = Math.hypot(samplePos.x - playerPos.x, samplePos.z - playerPos.z);
+          const playerHitDist = Math.hypot(this.tmpSamplePos.x - playerPos.x, this.tmpSamplePos.z - playerPos.z);
           const groundY = playerPos.y;
-          if (playerHitDist < 0.38 && samplePos.y >= groundY + 0.15 && samplePos.y <= playerEyeY + 0.18) {
+          if (playerHitDist < 0.38 && this.tmpSamplePos.y >= groundY + 0.15 && this.tmpSamplePos.y <= playerEyeY + 0.18) {
             callbacks.onHitPlayer(
               t.damage,
               t.pos,
@@ -328,7 +353,7 @@ export class ProjectileSystem {
             consumed = true;
             break;
           }
-          if (callbacks.onHitAllySoldier(samplePos, dir, t.damage)) {
+          if (callbacks.onHitAllySoldier(this.tmpSamplePos, this.tmpDir, t.damage)) {
             consumed = true;
             break;
           }
@@ -342,7 +367,7 @@ export class ProjectileSystem {
       }
 
       // World / cover hit
-      const worldHit = this.cover.raycastWorld(t.pos, dir, stepDist, true);
+      const worldHit = this.cover.raycastWorld(t.pos, this.tmpDir, stepDist, true);
       if (worldHit) {
         this.vfx.spawnBulletImpact(worldHit.point, worldHit.normal, false);
         if (worldHit.destructibleId) {
@@ -353,8 +378,8 @@ export class ProjectileSystem {
         continue;
       }
 
-      t.pos.copy(nextPos);
-      t.mesh.position.copy(nextPos);
+      t.pos.copy(this.tmpNextPos);
+      t.mesh.position.copy(this.tmpNextPos);
     }
 
     // 2. Rockets
@@ -362,17 +387,36 @@ export class ProjectileSystem {
       const r = this.rockets[i];
       r.age += dt;
       const stepDist = r.vel.length() * dt;
-      const dir = r.vel.clone().normalize();
-      const nextPos = r.pos.clone().addScaledVector(dir, stepDist);
+      this.tmpDir.copy(r.vel).normalize();
+      this.tmpNextPos.copy(r.pos).addScaledVector(this.tmpDir, stepDist);
 
       // Smoke trail
-      this.vfx.spawnSprite(r.pos, new THREE.Vector3(0, 0.3, 0), 0xcac6be, 0.32, 0.95, 0.55, 0.55, 0);
+      this.vfx.spawnSprite(r.pos, this.tmpRocketTrailVel, 0xcac6be, 0.32, 0.95, 0.55, 0.55, 0);
 
       let impactedPoint: THREE.Vector3 | null = null;
-      if (callbacks.onHitTank(nextPos, 0, true)) {
-        impactedPoint = nextPos;
-      } else {
-        const hit = this.cover.raycastWorld(r.pos, dir, stepDist, true);
+      for (let s = 1; s <= 2; s++) {
+        this.tmpSamplePos.copy(r.pos).lerp(this.tmpNextPos, s / 2);
+        if (r.faction === 'ally') {
+          if (
+            callbacks.onHitTank(this.tmpSamplePos, 115, true) ||
+            callbacks.onHitEnemySoldier(this.tmpSamplePos, this.tmpDir, 25, true)
+          ) {
+            impactedPoint = this.tmpSamplePos;
+            break;
+          }
+        } else {
+          if (
+            callbacks.onHitAllyTank?.(this.tmpSamplePos, 115, true) ||
+            callbacks.onHitAllySoldier(this.tmpSamplePos, this.tmpDir, 25)
+          ) {
+            impactedPoint = this.tmpSamplePos;
+            break;
+          }
+        }
+      }
+
+      if (!impactedPoint) {
+        const hit = this.cover.raycastWorld(r.pos, this.tmpDir, stepDist, true);
         if (hit) {
           impactedPoint = hit.point;
           if (hit.destructibleId) {
@@ -382,7 +426,7 @@ export class ProjectileSystem {
       }
 
       if (impactedPoint || r.age > 3.5) {
-        const expPos = impactedPoint ?? nextPos;
+        const expPos = impactedPoint ? impactedPoint.clone() : this.tmpNextPos.clone();
         callbacks.onExplosion(
           expPos,
           5.8,
@@ -399,8 +443,8 @@ export class ProjectileSystem {
         continue;
       }
 
-      r.pos.copy(nextPos);
-      r.mesh.position.copy(nextPos);
+      r.pos.copy(this.tmpNextPos);
+      r.mesh.position.copy(this.tmpNextPos);
     }
 
     // 3. Grenades
@@ -409,13 +453,13 @@ export class ProjectileSystem {
       g.fuse -= dt;
       g.vel.y -= 16.5 * dt;
 
-      const step = g.vel.clone().multiplyScalar(dt);
-      const nextPos = g.pos.clone().add(step);
+      this.tmpStep.copy(g.vel).multiplyScalar(dt);
+      this.tmpNextPos.copy(g.pos).add(this.tmpStep);
 
       // Bounce off terrain
-      const groundH = this.terrain.getTerrainHeight(nextPos.x, nextPos.z);
-      if (nextPos.y <= groundH + 0.09) {
-        nextPos.y = groundH + 0.09;
+      const groundH = this.terrain.getTerrainHeight(this.tmpNextPos.x, this.tmpNextPos.z);
+      if (this.tmpNextPos.y <= groundH + 0.09) {
+        this.tmpNextPos.y = groundH + 0.09;
         if (Math.abs(g.vel.y) > 1.8) {
           g.vel.y = Math.abs(g.vel.y) * 0.42;
           g.vel.x *= 0.62;
@@ -429,8 +473,8 @@ export class ProjectileSystem {
         }
       }
 
-      g.pos.copy(nextPos);
-      g.mesh.position.copy(nextPos);
+      g.pos.copy(this.tmpNextPos);
+      g.mesh.position.copy(this.tmpNextPos);
       g.mesh.rotation.x += dt * 7;
       g.mesh.rotation.z += dt * 5;
 
@@ -500,11 +544,12 @@ export class ProjectileSystem {
   }
 
   private pointSegmentDist(p: THREE.Vector3, a: THREE.Vector3, b: THREE.Vector3): number {
-    const ab = new THREE.Vector3().subVectors(b, a);
-    const lenSq = ab.lengthSq();
+    this.tmpAB.subVectors(b, a);
+    const lenSq = this.tmpAB.lengthSq();
     if (lenSq < 1e-5) return p.distanceTo(a);
-    const t = Math.max(0, Math.min(1, new THREE.Vector3().subVectors(p, a).dot(ab) / lenSq));
-    const proj = a.clone().addScaledVector(ab, t);
-    return p.distanceTo(proj);
+    this.tmpPA.subVectors(p, a);
+    const t = Math.max(0, Math.min(1, this.tmpPA.dot(this.tmpAB) / lenSq));
+    this.tmpProj.copy(a).addScaledVector(this.tmpAB, t);
+    return p.distanceTo(this.tmpProj);
   }
 }

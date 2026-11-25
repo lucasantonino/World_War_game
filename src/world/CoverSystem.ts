@@ -1,5 +1,12 @@
 import * as THREE from 'three';
-import { CoverState, DestructibleSpec, DestructionStage, RaycastHit, SmokeCloud } from '../types';
+import {
+  CoverState,
+  DestructibleSpec,
+  DestructionStage,
+  RaycastHit,
+  SmokeCloud,
+  TacticalCoverNode
+} from '../types';
 import { Terrain } from './Terrain';
 
 export interface SolidBoxCollider {
@@ -14,6 +21,29 @@ export interface SolidBoxCollider {
   blocksMovement: boolean;
   blocksSight: boolean;
   destructibleId?: string;
+  rotY?: number;
+  cx?: number;
+  cz?: number;
+  halfW?: number;
+  halfD?: number;
+  cosR?: number;
+  sinR?: number;
+}
+
+interface EnterableBuildingBounds {
+  buildingId: string;
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  ceilingY: number;
+  rotY: number;
+  cx: number;
+  cz: number;
+  halfW: number;
+  halfD: number;
+  cosR: number;
+  sinR: number;
 }
 
 export interface TankHullCollider {
@@ -57,6 +87,8 @@ export class CoverSystem {
   private tankHulls: TankHullCollider[] = [];
   private wireHazards: WireHazard[] = [];
   private smokeClouds: SmokeCloud[] = [];
+  private tacticalNodes: TacticalCoverNode[] = [];
+  private enterableBuildings = new Map<string, EnterableBuildingBounds>();
   private nextSmokeId = 1;
   private onStageChangedGlobal: ((spec: DestructibleSpec, stage: DestructionStage) => void) | null =
     null;
@@ -76,7 +108,173 @@ export class CoverSystem {
     this.destructibles.clear();
     this.tankHulls = [];
     this.wireHazards = [];
+    this.tacticalNodes = [];
+    this.enterableBuildings.clear();
     this.clearSmokeClouds();
+  }
+
+  public registerTacticalNode(node: TacticalCoverNode): void {
+    this.tacticalNodes.push({
+      ...node,
+      occupiedById: node.occupiedById ?? null
+    });
+  }
+
+  public getTacticalNodes(): readonly TacticalCoverNode[] {
+    return this.tacticalNodes;
+  }
+
+  public releaseTacticalNode(soldierId: number): void {
+    for (let i = 0; i < this.tacticalNodes.length; i++) {
+      if (this.tacticalNodes[i].occupiedById === soldierId) {
+        this.tacticalNodes[i].occupiedById = null;
+      }
+    }
+  }
+
+  public removeNodesForBuilding(buildingId: string): void {
+    this.tacticalNodes = this.tacticalNodes.filter((n) => n.buildingId !== buildingId);
+  }
+
+  public registerEnterableBuildingBounds(
+    buildingId: string,
+    minX: number,
+    maxX: number,
+    minZ: number,
+    maxZ: number,
+    ceilingY: number,
+    rotY = 0
+  ): void {
+    const cx = (minX + maxX) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    const halfW = (maxX - minX) * 0.5;
+    const halfD = (maxZ - minZ) * 0.5;
+    const cosR = Math.cos(rotY);
+    const sinR = Math.sin(rotY);
+    this.enterableBuildings.set(buildingId, {
+      buildingId,
+      minX,
+      maxX,
+      minZ,
+      maxZ,
+      ceilingY,
+      rotY,
+      cx,
+      cz,
+      halfW,
+      halfD,
+      cosR,
+      sinR
+    });
+  }
+
+  public removeEnterableBuildingBounds(buildingId: string): void {
+    this.enterableBuildings.delete(buildingId);
+  }
+
+  public isInsideEnterableBuilding(x: number, z: number): boolean {
+    for (const b of this.enterableBuildings.values()) {
+      if (Math.abs(b.rotY) <= 1e-4) {
+        if (x >= b.minX && x <= b.maxX && z >= b.minZ && z <= b.maxZ) {
+          return true;
+        }
+      } else {
+        const dx = x - b.cx;
+        const dz = z - b.cz;
+        // Inverse Y rotation (-rotY): lx = dx * cos - dz * sin, lz = dx * sin + dz * cos
+        const lx = dx * b.cosR - dz * b.sinR;
+        const lz = dx * b.sinR + dz * b.cosR;
+        if (Math.abs(lx) <= b.halfW && Math.abs(lz) <= b.halfD) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public findTacticalCoverNode(
+    fromX: number,
+    fromZ: number,
+    targetZ: number,
+    faction: 'ally' | 'enemy',
+    soldierId: number
+  ): TacticalCoverNode | null {
+    if (this.tacticalNodes.length === 0) return null;
+
+    const dzToTarget = targetZ - fromZ;
+    const distToTargetZ = Math.abs(dzToTarget);
+    const dirZ = distToTargetZ > 0.5 ? Math.sign(dzToTarget) : faction === 'enemy' ? 1 : -1;
+    const nearTarget = distToTargetZ <= 12;
+
+    let bestNode: TacticalCoverNode | null = null;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < this.tacticalNodes.length; i++) {
+      const node = this.tacticalNodes[i];
+      if (node.occupiedById != null && node.occupiedById !== soldierId) {
+        continue;
+      }
+
+      const stepZ = (node.z - fromZ) * dirZ;
+      const dist2D = Math.hypot(node.x - fromX, node.z - fromZ);
+      const overshootZ = (node.z - targetZ) * dirZ;
+
+      if (!nearTarget) {
+        // Require gradual forward progress (prefer 10m..30m hops, never skip to end of map)
+        if (stepZ < 3.0 || stepZ > Math.min(34.0, distToTargetZ + 6.0)) continue;
+        if (overshootZ > 8.0) continue;
+        if (dist2D > 42.0) continue;
+      } else {
+        // Already close to targetZ: allow holding/repositioning near targetZ
+        if (Math.abs(node.z - targetZ) > 14.0 || dist2D > 28.0) continue;
+      }
+
+      let score = 0;
+      if (node.insideBuilding) {
+        score += 48;
+      } else if (node.id.startsWith('ruin_') || node.id.startsWith('sandbag_')) {
+        score += 24;
+      } else {
+        score += 12;
+      }
+
+      if (!nearTarget) {
+        if (stepZ >= 10 && stepZ <= 30) {
+          score += 22 - Math.abs(stepZ - 18) * 0.45;
+        } else {
+          score += 8 - Math.abs(stepZ - 18) * 0.65;
+        }
+      } else {
+        score += 16 - Math.abs(node.z - targetZ) * 1.1;
+      }
+
+      // Penalize excessive lateral detour so soldiers advance naturally in lanes
+      score -= Math.abs(node.x - fromX) * 0.45;
+      score -= dist2D * 0.2;
+
+      // Slight preference for window facing toward enemy direction
+      if (node.windowDirZ !== undefined) {
+        const desiredFacing = faction === 'ally' ? -1 : 1;
+        if (node.windowDirZ * desiredFacing > 0.2) {
+          score += 6;
+        }
+      }
+
+      if (node.occupiedById === soldierId) {
+        score += 3;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestNode = node;
+      }
+    }
+
+    if (!bestNode) return null;
+
+    this.releaseTacticalNode(soldierId);
+    bestNode.occupiedById = soldierId;
+    return bestNode;
   }
 
   public addSmokeCloud(x: number, y: number, z: number, maxRadius = 6.2, duration = 14.0): void {
@@ -172,7 +370,18 @@ export class CoverSystem {
   }
 
   public addStaticBox(box: SolidBoxCollider): void {
+    if (box.rotY !== undefined && Math.abs(box.rotY) > 1e-4) {
+      box.cosR = Math.cos(box.rotY);
+      box.sinR = Math.sin(box.rotY);
+    }
     this.boxes.push(box);
+  }
+
+  public removeStaticCollidersByPrefix(prefix: string): void {
+    const wallPrefix = prefix.endsWith('_') ? prefix : `${prefix}_`;
+    this.boxes = this.boxes.filter(
+      (b) => !b.id.startsWith(wallPrefix) && b.destructibleId !== prefix
+    );
   }
 
   public registerDestructible(
@@ -193,7 +402,7 @@ export class CoverSystem {
       const effW = spec.width * cos + spec.depth * sin;
       const effD = spec.width * sin + spec.depth * cos;
 
-      this.boxes.push({
+      this.addStaticBox({
         id: `col_${spec.id}`,
         minX: spec.x - effW * 0.5,
         maxX: spec.x + effW * 0.5,
@@ -204,7 +413,12 @@ export class CoverSystem {
         blocksBullets: spec.blocksBullets,
         blocksMovement: spec.blocksMovement,
         blocksSight: spec.blocksSight,
-        destructibleId: spec.id
+        destructibleId: spec.id,
+        rotY: Math.abs(rot) > 1e-4 ? rot : undefined,
+        cx: spec.x,
+        cz: spec.z,
+        halfW: spec.width * 0.5,
+        halfD: spec.depth * 0.5
       });
     }
   }
@@ -229,9 +443,16 @@ export class CoverSystem {
 
     if (item.hp > 0 && item.hp <= item.maxHp * 0.58 && item.stage === 0) {
       item.stage = 1;
+      const stage1RoofLimit = item.y + item.height * 0.62;
       for (const box of this.boxes) {
         if (box.destructibleId === id) {
-          box.maxY = box.minY + item.height * 0.62;
+          if (box.minY >= item.y + item.height * 0.56) {
+            box.blocksBullets = false;
+            box.blocksMovement = false;
+            box.blocksSight = false;
+          } else {
+            box.maxY = Math.min(box.maxY, stage1RoofLimit);
+          }
         }
       }
       item.onStageChange?.(1, item);
@@ -245,7 +466,7 @@ export class CoverSystem {
         if (item.onStageChange) {
           for (const box of this.boxes) {
             if (box.destructibleId === id) {
-              box.maxY = box.minY + Math.max(0.22, item.height * 0.24);
+              box.maxY = Math.min(box.maxY, item.y + Math.max(0.22, item.height * 0.24));
               box.blocksMovement = false;
               box.blocksSight = false;
               box.blocksBullets = true;
@@ -377,6 +598,44 @@ export class CoverSystem {
       if (!b.blocksMovement) continue;
       if (playerTop <= b.minY || playerBottom >= b.maxY) continue;
 
+      if (b.cosR !== undefined && b.sinR !== undefined && b.cx !== undefined && b.cz !== undefined && b.halfW !== undefined && b.halfD !== undefined) {
+        if (nx + radius < b.minX || nx - radius > b.maxX || nz + radius < b.minZ || nz - radius > b.maxZ) {
+          continue;
+        }
+        const relX = nx - b.cx;
+        const relZ = nz - b.cz;
+        let lx = relX * b.cosR - relZ * b.sinR;
+        let lz = relX * b.sinR + relZ * b.cosR;
+
+        const closestX = Math.max(-b.halfW, Math.min(lx, b.halfW));
+        const closestZ = Math.max(-b.halfD, Math.min(lz, b.halfD));
+        const dx = lx - closestX;
+        const dz = lz - closestZ;
+        const distSq = dx * dx + dz * dz;
+
+        if (distSq < radius * radius) {
+          const dist = Math.sqrt(distSq);
+          if (dist > 1e-4) {
+            const push = radius - dist;
+            lx += (dx / dist) * push;
+            lz += (dz / dist) * push;
+          } else {
+            const leftPen = Math.abs(lx + b.halfW);
+            const rightPen = Math.abs(b.halfW - lx);
+            const topPen = Math.abs(lz + b.halfD);
+            const botPen = Math.abs(b.halfD - lz);
+            const minPen = Math.min(leftPen, rightPen, topPen, botPen);
+            if (minPen === leftPen) lx = -b.halfW - radius;
+            else if (minPen === rightPen) lx = b.halfW + radius;
+            else if (minPen === topPen) lz = -b.halfD - radius;
+            else lz = b.halfD + radius;
+          }
+          nx = b.cx + lx * b.cosR + lz * b.sinR;
+          nz = b.cz - lx * b.sinR + lz * b.cosR;
+        }
+        continue;
+      }
+
       const closestX = Math.max(b.minX, Math.min(nx, b.maxX));
       const closestZ = Math.max(b.minZ, Math.min(nz, b.maxZ));
       const dx = nx - closestX;
@@ -437,6 +696,8 @@ export class CoverSystem {
       };
     }
 
+    const inBuilding = this.isInsideEnterableBuilding(pos.x, pos.z);
+
     // Check surrounding earth height & obstacles toward enemy front (-Z and diagonals)
     const sampleAngles = [0, -0.45, 0.45];
     let shieldedRays = 0;
@@ -468,7 +729,16 @@ export class CoverSystem {
       return {
         state: 'sheltered',
         exposure: 0.04,
-        overheadProtected: false,
+        overheadProtected: inBuilding,
+        inWireHazard
+      };
+    }
+
+    if (inBuilding) {
+      return {
+        state: isCrouching ? 'sheltered' : 'peeking',
+        exposure: isCrouching ? 0.06 : 0.34,
+        overheadProtected: true,
         inWireHazard
       };
     }
@@ -500,21 +770,62 @@ export class CoverSystem {
   ): RaycastHit | null {
     let closestDist = maxDist;
     let closestHit: RaycastHit | null = null;
+    const invX = dir.x !== 0 ? 1 / dir.x : 1e9;
+    const invY = dir.y !== 0 ? 1 / dir.y : 1e9;
+    const invZ = dir.z !== 0 ? 1 / dir.z : 1e9;
 
-    // 1. Box colliders (sandbags, ruins, bunkers, dugout walls)
-    for (const b of this.boxes) {
+    // 1. Box colliders (sandbags, ruins, bunkers, dugout walls, enterable building walls)
+    let winningBox: SolidBoxCollider | null = null;
+    let winningFace = 0; // 0=X, 1=Y, 2=Z
+    let winningSign = 1;
+
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
       if (!b.blocksBullets) continue;
-      const hit = this.intersectRayAABB(origin, dir, b, closestDist);
-      if (hit && hit.distance < closestDist) {
-        closestDist = hit.distance;
-        closestHit = {
-          point: hit.point,
-          normal: hit.normal,
-          distance: hit.distance,
-          hitType: b.destructibleId ? 'destructible' : 'obstacle',
-          destructibleId: b.destructibleId
-        };
+      const res = this.intersectRayBoxRaw(
+        origin.x,
+        origin.y,
+        origin.z,
+        dir.x,
+        dir.y,
+        dir.z,
+        invX,
+        invY,
+        invZ,
+        b,
+        closestDist
+      );
+      if (res && res.distance < closestDist) {
+        closestDist = res.distance;
+        winningBox = b;
+        winningFace = res.face;
+        winningSign = res.sign;
       }
+    }
+
+    if (winningBox) {
+      const point = origin.clone().addScaledVector(dir, closestDist);
+      let nx = 0;
+      let ny = 0;
+      let nz = 0;
+      if (winningFace === 1) {
+        ny = winningSign;
+      } else if (winningBox.cosR !== undefined && winningBox.sinR !== undefined) {
+        const lnx = winningFace === 0 ? winningSign : 0;
+        const lnz = winningFace === 2 ? winningSign : 0;
+        nx = lnx * winningBox.cosR + lnz * winningBox.sinR;
+        nz = -lnx * winningBox.sinR + lnz * winningBox.cosR;
+      } else {
+        if (winningFace === 0) nx = winningSign;
+        else nz = winningSign;
+      }
+      closestHit = {
+        point,
+        normal: new THREE.Vector3(nx, ny, nz),
+        distance: closestDist,
+        hitType: winningBox.destructibleId ? 'destructible' : 'obstacle',
+        destructibleId: winningBox.destructibleId
+      };
     }
 
     // 2. Terrain heightfield raymarch with binary refinement
@@ -576,43 +887,139 @@ export class CoverSystem {
   }
 
   public hasLineOfSight(from: THREE.Vector3, to: THREE.Vector3): boolean {
-    const delta = new THREE.Vector3().subVectors(to, from);
-    const dist = delta.length();
-    if (dist < 0.1) return true;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dz = to.z - from.z;
+    const distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq < 0.01) return true;
     if (this.isSegmentBlockedBySmoke(from.x, from.y, from.z, to.x, to.y, to.z)) {
       return false;
     }
-    const dir = delta.divideScalar(dist);
-    const hit = this.raycastWorld(from, dir, dist - 0.15, true);
-    return hit === null;
+
+    const dist = Math.sqrt(distSq);
+    const maxDist = dist - 0.15;
+    if (maxDist <= 0.02) return true;
+
+    const invDist = 1 / dist;
+    const dirX = dx * invDist;
+    const dirY = dy * invDist;
+    const dirZ = dz * invDist;
+    const invX = dirX !== 0 ? 1 / dirX : 1e9;
+    const invY = dirY !== 0 ? 1 / dirY : 1e9;
+    const invZ = dirZ !== 0 ? 1 / dirZ : 1e9;
+
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      if (!b.blocksSight) continue;
+      if (
+        this.intersectRayBoxRaw(
+          from.x,
+          from.y,
+          from.z,
+          dirX,
+          dirY,
+          dirZ,
+          invX,
+          invY,
+          invZ,
+          b,
+          maxDist
+        ) !== null
+      ) {
+        return false;
+      }
+    }
+
+    const step = 0.65;
+    let prevDiff = from.y - this.terrain.getTerrainHeight(from.x, from.z);
+    for (let t = step; t <= maxDist; t += step) {
+      const px = from.x + dirX * t;
+      const py = from.y + dirY * t;
+      const pz = from.z + dirZ * t;
+      const diff = py - this.terrain.getTerrainHeight(px, pz);
+      if (diff <= 0 && prevDiff > 0) {
+        return false;
+      }
+      prevDiff = diff;
+    }
+
+    return true;
   }
 
-  private intersectRayAABB(
-    origin: THREE.Vector3,
-    dir: THREE.Vector3,
+  private intersectRayBoxRaw(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    invX: number,
+    invY: number,
+    invZ: number,
     box: SolidBoxCollider,
     maxDist: number
-  ): { distance: number; point: THREE.Vector3; normal: THREE.Vector3 } | null {
-    const invX = dir.x !== 0 ? 1 / dir.x : 1e9;
-    const invY = dir.y !== 0 ? 1 / dir.y : 1e9;
-    const invZ = dir.z !== 0 ? 1 / dir.z : 1e9;
+  ): { distance: number; face: number; sign: number } | null {
+    // Broadphase AABB check
+    const bt1 = (box.minX - ox) * invX;
+    const bt2 = (box.maxX - ox) * invX;
+    const bt3 = (box.minY - oy) * invY;
+    const bt4 = (box.maxY - oy) * invY;
+    const bt5 = (box.minZ - oz) * invZ;
+    const bt6 = (box.maxZ - oz) * invZ;
 
-    const t1 = (box.minX - origin.x) * invX;
-    const t2 = (box.maxX - origin.x) * invX;
-    const t3 = (box.minY - origin.y) * invY;
-    const t4 = (box.maxY - origin.y) * invY;
-    const t5 = (box.minZ - origin.z) * invZ;
-    const t6 = (box.maxZ - origin.z) * invZ;
+    const btminX = bt1 < bt2 ? bt1 : bt2;
+    const btmaxX = bt1 > bt2 ? bt1 : bt2;
+    const btminY = bt3 < bt4 ? bt3 : bt4;
+    const btmaxY = bt3 > bt4 ? bt3 : bt4;
+    const btminZ = bt5 < bt6 ? bt5 : bt6;
+    const btmaxZ = bt5 > bt6 ? bt5 : bt6;
 
-    const tminX = Math.min(t1, t2);
-    const tmaxX = Math.max(t1, t2);
-    const tminY = Math.min(t3, t4);
-    const tmaxY = Math.max(t3, t4);
-    const tminZ = Math.min(t5, t6);
-    const tmaxZ = Math.max(t5, t6);
+    const btmin = Math.max(btminX, btminY, btminZ);
+    const btmax = Math.min(btmaxX, btmaxY, btmaxZ);
 
-    const tmin = Math.max(tminX, tminY, tminZ);
-    const tmax = Math.min(tmaxX, tmaxY, tmaxZ);
+    if (btmax < 0 || btmin > btmax || btmin > maxDist) {
+      return null;
+    }
+
+    // If axis-aligned, broadphase IS exact!
+    if (
+      box.cosR === undefined ||
+      box.sinR === undefined ||
+      box.cx === undefined ||
+      box.cz === undefined ||
+      box.halfW === undefined ||
+      box.halfD === undefined
+    ) {
+      const hitDist = btmin >= 0 ? btmin : btmax;
+      if (hitDist > maxDist || hitDist < 0.02) return null;
+      if (btmin === btminX) return { distance: hitDist, face: 0, sign: dx > 0 ? -1 : 1 };
+      if (btmin === btminY) return { distance: hitDist, face: 1, sign: dy > 0 ? -1 : 1 };
+      return { distance: hitDist, face: 2, sign: dz > 0 ? -1 : 1 };
+    }
+
+    // Exact OBB intersection in box local space
+    const rx = ox - box.cx;
+    const rz = oz - box.cz;
+    const lox = rx * box.cosR - rz * box.sinR;
+    const loz = rx * box.sinR + rz * box.cosR;
+    const ldx = dx * box.cosR - dz * box.sinR;
+    const ldz = dx * box.sinR + dz * box.cosR;
+
+    const linvX = ldx !== 0 ? 1 / ldx : 1e9;
+    const linvZ = ldz !== 0 ? 1 / ldz : 1e9;
+
+    const t1 = (-box.halfW - lox) * linvX;
+    const t2 = (box.halfW - lox) * linvX;
+    const t5 = (-box.halfD - loz) * linvZ;
+    const t6 = (box.halfD - loz) * linvZ;
+
+    const tminX = t1 < t2 ? t1 : t2;
+    const tmaxX = t1 > t2 ? t1 : t2;
+    const tminZ = t5 < t6 ? t5 : t6;
+    const tmaxZ = t5 > t6 ? t5 : t6;
+
+    const tmin = Math.max(tminX, btminY, tminZ);
+    const tmax = Math.min(tmaxX, btmaxY, tmaxZ);
 
     if (tmax < 0 || tmin > tmax || tmin > maxDist) {
       return null;
@@ -621,12 +1028,8 @@ export class CoverSystem {
     const hitDist = tmin >= 0 ? tmin : tmax;
     if (hitDist > maxDist || hitDist < 0.02) return null;
 
-    const normal = new THREE.Vector3(0, 1, 0);
-    if (tmin === tminX) normal.set(dir.x > 0 ? -1 : 1, 0, 0);
-    else if (tmin === tminY) normal.set(0, dir.y > 0 ? -1 : 1, 0);
-    else normal.set(0, 0, dir.z > 0 ? -1 : 1);
-
-    const point = origin.clone().addScaledVector(dir, hitDist);
-    return { distance: hitDist, point, normal };
+    if (tmin === tminX) return { distance: hitDist, face: 0, sign: ldx > 0 ? -1 : 1 };
+    if (tmin === btminY) return { distance: hitDist, face: 1, sign: dy > 0 ? -1 : 1 };
+    return { distance: hitDist, face: 2, sign: ldz > 0 ? -1 : 1 };
   }
 }

@@ -26,8 +26,10 @@ const COLOR_ENEMY_ASSAULT = new THREE.Color(0x525754);
 const COLOR_ENEMY_GRENADIER = new THREE.Color(0x575248);
 const COLOR_ENEMY_MG = new THREE.Color(0x444846);
 const COLOR_ENEMY_OFFICER = new THREE.Color(0x3b3e3c);
+const COLOR_ENEMY_FLAME = new THREE.Color(0x323330);
 const COLOR_ENEMY_HELMET = new THREE.Color(0x2f3332);
 const COLOR_OFFICER_HELMET = new THREE.Color(0x252827);
+const COLOR_FLAME_HELMET = new THREE.Color(0x1e201d);
 
 function transformPart(
   geo: THREE.BufferGeometry,
@@ -191,6 +193,14 @@ export interface Soldier {
   isCrouching: boolean;
   emplaced: boolean;
 
+  coverNodeId: string | null;
+  tacticalMode: 'bound' | 'hold_cover' | 'peek_fire' | 'suppressed';
+  tacticalTimer: number;
+  peekCycleTimer: number;
+  suppressedTimer: number;
+  flameTickTimer: number;
+  finalObjectiveZ: number;
+
   missingHead: boolean;
   missingLeftLeg: boolean;
   missingRightLeg: boolean;
@@ -227,6 +237,8 @@ export class SoldierSystem {
   private reinforcementQueue: ReinforcementBatch[] = [];
   private maxSimultaneousEnemies = MAX_SOLDIERS;
   private colorsDirty = false;
+  private onSoldierKilled: ((pos: THREE.Vector3, role: SoldierRole, faction: 'ally' | 'enemy') => void) | null = null;
+  private onPlayerThermalDamage: ((damage: number, origin: THREE.Vector3) => void) | null = null;
 
   // Spatial Grid 2D (CELL_SIZE = 4) with array pooling for zero per-frame allocations
   private spatialGrid: Map<number, Soldier[]> = new Map();
@@ -266,6 +278,7 @@ export class SoldierSystem {
   private tmpVel = new THREE.Vector3();
   private tmpHitPos = new THREE.Vector3();
   private tmpBlastDir = new THREE.Vector3();
+  private tmpFlamePos = new THREE.Vector3();
 
   // Reusable per-frame candidate buffers
   private lod0Candidates: Soldier[] = [];
@@ -322,7 +335,22 @@ export class SoldierSystem {
     }
   }
 
+  public setOnSoldierKilled(
+    cb: ((pos: THREE.Vector3, role: SoldierRole, faction: 'ally' | 'enemy') => void) | null
+  ): void {
+    this.onSoldierKilled = cb;
+  }
+
+  public setOnPlayerThermalDamage(
+    cb: ((damage: number, origin: THREE.Vector3) => void) | null
+  ): void {
+    this.onPlayerThermalDamage = cb;
+  }
+
   public clear(): void {
+    for (let i = 0; i < this.soldiers.length; i++) {
+      this.cover.releaseTacticalNode(this.soldiers[i].id);
+    }
     this.soldiers = [];
     this.reinforcementQueue = [];
     this.maxSimultaneousEnemies = MAX_SOLDIERS;
@@ -400,6 +428,30 @@ export class SoldierSystem {
     this.syncInstancedMeshes();
   }
 
+  public spawnSquadAt(x: number, z: number, count: number, roles?: SoldierRole[]): void {
+    if (count <= 0) return;
+    const roleList: SoldierRole[] = roles && roles.length > 0 ? roles : ['assault', 'rifleman'];
+
+    for (let i = 0; i < count; i++) {
+      if (this.soldiers.length >= MAX_SOLDIERS) break;
+      const angle = (i / Math.max(1, count)) * Math.PI * 2 + Math.random() * 0.5;
+      const dist = 1.2 + Math.random() * 1.8;
+      const sx = THREE.MathUtils.clamp(x + Math.cos(angle) * dist, -42, 42);
+      const sz = THREE.MathUtils.clamp(z + Math.sin(angle) * dist, -65, 32);
+      const role = roleList[i % roleList.length];
+      const s = this.spawnSoldier('enemy', role, sx, sz, false);
+      if (s) {
+        this.cover.releaseTacticalNode(s.id);
+        const node = this.cover.findTacticalCoverNode(sx, sz, Math.min(24, sz + 12), 'enemy', s.id);
+        if (node) {
+          s.coverNodeId = node.id;
+          s.targetPos.set(node.x, node.y, node.z);
+        }
+      }
+    }
+    this.syncInstancedMeshes();
+  }
+
   public queueEnemyWave(
     totalCount: number,
     roles: SoldierRole[],
@@ -429,25 +481,81 @@ export class SoldierSystem {
   ): Soldier | null {
     if (this.soldiers.length >= MAX_SOLDIERS) return null;
 
+    const id = this.nextId++;
     const y = this.terrain.getTerrainHeight(x, z);
-    const hp = role === 'mg_gunner' ? 120 : role === 'officer' ? 115 : 85;
-    const targetZ =
+    const hp =
+      role === 'flamethrower'
+        ? 135
+        : role === 'mg_gunner'
+          ? 120
+          : role === 'officer'
+            ? 115
+            : 85;
+    const finalObjectiveZ =
       faction === 'ally'
         ? z
-        : role === 'grenadier'
-          ? 12 + Math.random() * 6
-          : 23 + Math.random() * 8;
+        : role === 'flamethrower'
+          ? 24
+          : role === 'grenadier'
+            ? 12 + Math.random() * 6
+            : 23 + Math.random() * 8;
 
     const uniformColor = this.getUniformColor(faction, role);
     const helmetColor =
       faction === 'ally'
         ? COLOR_ALLY_HELMET
-        : role === 'officer'
-          ? COLOR_OFFICER_HELMET
-          : COLOR_ENEMY_HELMET;
+        : role === 'flamethrower'
+          ? COLOR_FLAME_HELMET
+          : role === 'officer'
+            ? COLOR_OFFICER_HELMET
+            : COLOR_ENEMY_HELMET;
+
+    let coverNodeId: string | null = null;
+    let targetX = x * 0.72 + (Math.random() - 0.5) * 10;
+    let targetY = y;
+    let targetZ = finalObjectiveZ;
+    let tacticalMode: Soldier['tacticalMode'] = 'hold_cover';
+    let tacticalTimer = 3.0 + Math.random() * 3.5;
+    let peekCycleTimer = 1.8 + Math.random() * 1.4;
+
+    if (!emplaced) {
+      const initialSearchZ = faction === 'enemy' ? Math.min(finalObjectiveZ, z + 11) : z;
+      const node = this.cover.findTacticalCoverNode(x, z, initialSearchZ, faction, id);
+      if (node) {
+        coverNodeId = node.id;
+        targetX = node.x;
+        targetY = node.y;
+        targetZ = node.z;
+      }
+
+      if (faction === 'enemy') {
+        let livingEnemies = 0;
+        let boundingEnemies = 0;
+        for (let i = 0; i < this.soldiers.length; i++) {
+          const other = this.soldiers[i];
+          if (other.alive && other.faction === 'enemy' && !other.emplaced) {
+            livingEnemies++;
+            if (other.tacticalMode === 'bound') boundingEnemies++;
+          }
+        }
+        const maxAllowed = Math.max(2, Math.round((livingEnemies + 1) * 0.32));
+        if (boundingEnemies < maxAllowed) {
+          tacticalMode = 'bound';
+        } else {
+          tacticalMode = Math.random() < 0.5 ? 'hold_cover' : 'peek_fire';
+          tacticalTimer = 2.0 + Math.random() * 4.0;
+        }
+      } else {
+        tacticalMode = 'hold_cover';
+        tacticalTimer = 4.0 + Math.random() * 3.0;
+      }
+    } else {
+      tacticalMode = 'peek_fire';
+      tacticalTimer = 999;
+    }
 
     const soldier: Soldier = {
-      id: this.nextId++,
+      id,
       faction,
       role,
       uniformColor,
@@ -462,7 +570,7 @@ export class SoldierSystem {
       fallOffsetY: 0,
       fallDir: 1,
       fallRoll: 0,
-      targetPos: new THREE.Vector3(x * 0.72 + (Math.random() - 0.5) * 10, 0, targetZ),
+      targetPos: new THREE.Vector3(targetX, targetY, targetZ),
       fireCooldown: 0.6 + Math.random() * 1.1,
       grenadeCooldown: 5 + Math.random() * 6,
       firstShotGrace: 0.35,
@@ -472,8 +580,15 @@ export class SoldierSystem {
       leftLegRotX: 0,
       rightLegRotX: 0,
       torsoY: 0.85,
-      isCrouching: false,
+      isCrouching: tacticalMode === 'hold_cover',
       emplaced,
+      coverNodeId,
+      tacticalMode,
+      tacticalTimer,
+      peekCycleTimer,
+      suppressedTimer: 0,
+      flameTickTimer: 0,
+      finalObjectiveZ,
       missingHead: false,
       missingLeftLeg: false,
       missingRightLeg: false,
@@ -506,6 +621,121 @@ export class SoldierSystem {
       pending += this.reinforcementQueue[i].remaining;
     }
     return this.getLivingEnemyCount() + pending;
+  }
+
+  public suppressInRadius(x: number, z: number, radius: number, duration = 2.6): void {
+    const minCx = Math.floor((x - radius) / CELL_SIZE) + 128;
+    const maxCx = Math.floor((x + radius) / CELL_SIZE) + 128;
+    const minCz = Math.floor((z - radius) / CELL_SIZE) + 128;
+    const maxCz = Math.floor((z + radius) / CELL_SIZE) + 128;
+    const rSq = radius * radius;
+
+    for (let cx = minCx; cx <= maxCx; cx++) {
+      const rowBase = cx * 256;
+      for (let cz = minCz; cz <= maxCz; cz++) {
+        const cell = this.spatialGrid.get(rowBase + cz);
+        if (!cell) continue;
+        for (let i = 0; i < cell.length; i++) {
+          const s = cell[i];
+          if (!s.alive || s.emplaced) continue;
+          const dx = s.pos.x - x;
+          const dz = s.pos.z - z;
+          if (dx * dx + dz * dz <= rSq) {
+            s.tacticalMode = 'suppressed';
+            s.suppressedTimer = Math.max(s.suppressedTimer, duration);
+            s.isCrouching = true;
+            s.isMoving = false;
+          }
+        }
+      }
+    }
+  }
+
+  public checkMeleeHit(
+    origin: THREE.Vector3,
+    forward: THREE.Vector3,
+    maxRange = 2.4
+  ): { hit: boolean; killed: boolean; pos?: THREE.Vector3; role?: SoldierRole } {
+    this.tmpDir.copy(forward).normalize();
+    let bestSoldier: Soldier | null = null;
+    let bestDistSq = maxRange * maxRange;
+
+    for (let i = 0; i < this.soldiers.length; i++) {
+      const s = this.soldiers[i];
+      if (!s.alive || s.faction !== 'enemy') continue;
+
+      const targetY = s.pos.y + (s.isCrouching ? 0.68 : 1.05);
+      const dx = s.pos.x - origin.x;
+      const dy = targetY - origin.y;
+      const dz = s.pos.z - origin.z;
+      const distSq = dx * dx + dy * dy + dz * dz;
+      if (distSq > bestDistSq || distSq < 1e-5) continue;
+
+      const invDist = 1 / Math.sqrt(distSq);
+      const dot = (dx * this.tmpDir.x + dy * this.tmpDir.y + dz * this.tmpDir.z) * invDist;
+      if (dot > 0.45) {
+        bestDistSq = distSq;
+        bestSoldier = s;
+      }
+    }
+
+    if (!bestSoldier) return { hit: false, killed: false };
+
+    const damage = 155;
+    bestSoldier.hp -= damage;
+    this.tmpHitPos.set(
+      bestSoldier.pos.x,
+      bestSoldier.pos.y + (bestSoldier.isCrouching ? 0.72 : 1.08),
+      bestSoldier.pos.z
+    );
+    this.vfx.spawnBloodSplatter(this.tmpHitPos, this.tmpDir, 1.45);
+
+    const killed = bestSoldier.hp <= 0;
+    if (killed) {
+      this.handleSoldierDeath(bestSoldier, false, damage, false, this.tmpDir);
+      if (Math.random() < 0.45) {
+        this.vfx.spawnDismemberment(this.tmpHitPos, 'torso', this.tmpDir);
+      }
+    } else {
+      bestSoldier.tacticalMode = 'suppressed';
+      bestSoldier.suppressedTimer = Math.max(bestSoldier.suppressedTimer, 2.0);
+      bestSoldier.isCrouching = true;
+    }
+
+    return {
+      hit: true,
+      killed,
+      pos: bestSoldier.pos.clone(),
+      role: bestSoldier.role
+    };
+  }
+
+  private handleSoldierDeath(
+    s: Soldier,
+    isHeadshot: boolean,
+    hitDamage: number,
+    isExplosive: boolean,
+    blastDir?: THREE.Vector3
+  ): void {
+    s.alive = false;
+    s.deathTimer = 0;
+    this.cover.releaseTacticalNode(s.id);
+    this.onSoldierKilled?.(s.pos, s.role, s.faction);
+
+    // Suppress nearby teammates when someone dies right beside them
+    this.suppressInRadius(s.pos.x, s.pos.z, 4.5, 1.5);
+
+    // Flamethrower tank rupture explosion on headshot, critical hit (>= 70), or explosive kill
+    if (s.role === 'flamethrower' && (isHeadshot || hitDamage >= 70 || isExplosive)) {
+      this.tmpFlamePos.set(s.pos.x, s.pos.y + 0.9, s.pos.z);
+      this.vfx.spawnExplosion(this.tmpFlamePos, 1.05);
+      this.audio.playExplosion(Math.max(4, Math.sqrt(s.distToPlayerSq)), 0.92, 0);
+      this.applyBlastDamage(this.tmpFlamePos, 4.0, 95, true);
+    } else if (isHeadshot && blastDir) {
+      s.missingHead = true;
+      this.tmpHitPos.set(s.pos.x, s.pos.y + (s.isCrouching ? 0.92 : 1.28), s.pos.z);
+      this.vfx.spawnDismemberment(this.tmpHitPos, 'head', blastDir);
+    }
   }
 
   public checkBulletHit(
@@ -542,16 +772,15 @@ export class SoldierSystem {
           s.hp -= finalDmg;
           this.vfx.spawnBloodSplatter(point, dir, isHeadshot ? 1.5 : 0.9);
           if (s.hp <= 0) {
-            s.alive = false;
-            s.deathTimer = 0;
             s.fallDir = Math.random() < 0.75 ? 1 : -1;
             s.fallRoll = (Math.random() - 0.5) * 0.48;
-            if (isHeadshot) {
-              s.missingHead = true;
-              this.tmpHitPos.set(s.pos.x, s.pos.y + (s.isCrouching ? 0.92 : 1.28), s.pos.z);
-              this.vfx.spawnDismemberment(this.tmpHitPos, 'head', dir);
-            }
+            this.handleSoldierDeath(s, isHeadshot, finalDmg, false, dir);
             onKill?.(s, isHeadshot);
+          } else if (!s.emplaced) {
+            s.tacticalMode = 'suppressed';
+            s.suppressedTimer = Math.max(s.suppressedTimer, 1.8);
+            s.isCrouching = true;
+            s.isMoving = false;
           }
           return { hit: true, headshot: isHeadshot };
         }
@@ -602,8 +831,6 @@ export class SoldierSystem {
             }
 
             if (s.hp <= 0) {
-              s.alive = false;
-              s.deathTimer = 0;
               s.fallDir = Math.random() < 0.5 ? 1 : -1;
               s.fallRoll = (Math.random() - 0.5) * 0.72;
 
@@ -636,10 +863,19 @@ export class SoldierSystem {
               } else {
                 this.vfx.spawnBloodSplatter(this.tmpHitPos, this.tmpBlastDir, 1.2);
               }
+              this.handleSoldierDeath(s, false, dmg, true, this.tmpBlastDir);
               onKill?.(s);
-            } else if (dmg >= 25) {
-              this.tmpHitPos.set(s.pos.x, s.pos.y + 0.9, s.pos.z);
-              this.vfx.spawnBloodSplatter(this.tmpHitPos, this.tmpBlastDir, 1.0);
+            } else {
+              if (!s.emplaced) {
+                s.tacticalMode = 'suppressed';
+                s.suppressedTimer = Math.max(s.suppressedTimer, 2.4);
+                s.isCrouching = true;
+                s.isMoving = false;
+              }
+              if (dmg >= 25) {
+                this.tmpHitPos.set(s.pos.x, s.pos.y + 0.9, s.pos.z);
+                this.vfx.spawnBloodSplatter(this.tmpHitPos, this.tmpBlastDir, 1.0);
+              }
             }
           }
         }
@@ -690,17 +926,21 @@ export class SoldierSystem {
     airRaidActive: boolean,
     onRadioShout: (msg: string) => void,
     peekDanger = 0,
-    diffConfig: DifficultyModifier = getDifficultyConfig('veteran')
+    diffConfig: DifficultyModifier = getDifficultyConfig('veteran'),
+    onPlayerThermalDamage?: (damage: number, origin: THREE.Vector3) => void
   ): void {
     this.frameCounter++;
     this.drainReinforcementQueue();
     this.rebuildSpatialGrid();
 
     this.tmpPlayerHead.set(playerPos.x, playerEyeY, playerPos.z);
+    const thermalCb = onPlayerThermalDamage ?? this.onPlayerThermalDamage;
 
-    // Classify living allies & LOD0 enemy candidates (< 32m, capped at 32 closest)
+    // Classify living allies, bounding enemy ratio, & LOD0 enemy candidates (< 32m, capped at 32 closest)
     this.lod0Candidates.length = 0;
     this.livingAllies.length = 0;
+    let livingEnemyCount = 0;
+    let boundingEnemyCount = 0;
 
     for (let i = 0; i < this.soldiers.length; i++) {
       const s = this.soldiers[i];
@@ -709,6 +949,10 @@ export class SoldierSystem {
       if (s.faction === 'ally') {
         this.livingAllies.push(s);
       } else {
+        livingEnemyCount++;
+        if (!s.emplaced && s.tacticalMode === 'bound') {
+          boundingEnemyCount++;
+        }
         s.isLod0 = false;
         s.canFocusPlayer = false;
         const dx = s.pos.x - playerPos.x;
@@ -729,10 +973,13 @@ export class SoldierSystem {
     for (let i = 0; i < lod0Count; i++) {
       const candidate = this.lod0Candidates[i];
       candidate.isLod0 = true;
-      if (i < DIRECT_SHOOTER_MAX) {
+      if (i < DIRECT_SHOOTER_MAX || (candidate.role === 'flamethrower' && candidate.distToPlayerSq < 20 * 20)) {
         candidate.canFocusPlayer = true;
       }
     }
+
+    // Staggered advance cap: ~28-35% of living enemies moving between cover simultaneously
+    const maxBoundEnemies = Math.max(2, Math.round(livingEnemyCount * 0.32));
 
     // Update soldiers (backwards for O(1) swap-and-pop corpse recycling)
     for (let i = this.soldiers.length - 1; i >= 0; i--) {
@@ -764,21 +1011,29 @@ export class SoldierSystem {
       }
 
       if (s.faction === 'ally') {
-        this.updateAlly(s, dt, airRaidActive);
-      } else if (s.isLod0) {
-        this.updateEnemyLod0(
-          s,
-          dt,
-          playerPos,
-          this.tmpPlayerHead,
-          playerExposure,
-          onRadioShout,
-          peekDanger,
-          diffConfig
-        );
+        this.updateAlly(s, dt, airRaidActive, playerPos);
       } else {
-        this.updateEnemyLod1(s, dt, playerPos, this.tmpPlayerHead, diffConfig);
+        const allowNewBound = boundingEnemyCount < maxBoundEnemies;
+        const startedBound = s.isLod0
+          ? this.updateEnemyLod0(
+              s,
+              dt,
+              playerPos,
+              this.tmpPlayerHead,
+              playerExposure,
+              onRadioShout,
+              peekDanger,
+              diffConfig,
+              allowNewBound,
+              thermalCb
+            )
+          : this.updateEnemyLod1(s, dt, playerPos, this.tmpPlayerHead, diffConfig, allowNewBound);
+        if (startedBound) {
+          boundingEnemyCount++;
+        }
       }
+
+      s.torsoY = THREE.MathUtils.lerp(s.torsoY, s.isCrouching ? 0.54 : 0.85, Math.min(1, dt * 9));
     }
 
     this.syncInstancedMeshes();
@@ -852,6 +1107,8 @@ export class SoldierSystem {
   private getUniformColor(faction: 'ally' | 'enemy', role: SoldierRole): THREE.Color {
     if (faction === 'ally') return COLOR_ALLY_UNIFORM;
     switch (role) {
+      case 'flamethrower':
+        return COLOR_ENEMY_FLAME;
       case 'officer':
         return COLOR_ENEMY_OFFICER;
       case 'mg_gunner':
@@ -865,10 +1122,98 @@ export class SoldierSystem {
     }
   }
 
-  private updateAlly(s: Soldier, dt: number, airRaidActive: boolean): void {
-    s.isMoving = false;
-    s.isCrouching = airRaidActive;
-    s.torsoY = THREE.MathUtils.lerp(s.torsoY, s.isCrouching ? 0.52 : 0.85, dt * 8);
+  private updateAlly(
+    s: Soldier,
+    dt: number,
+    airRaidActive: boolean,
+    playerPos: THREE.Vector3
+  ): void {
+    const insideBuilding = this.cover.isInsideEnterableBuilding(s.pos.x, s.pos.z);
+    const mustDuckAirRaid = airRaidActive && !insideBuilding;
+
+    if (s.suppressedTimer > 0) {
+      s.suppressedTimer -= dt;
+      s.tacticalMode = 'suppressed';
+      s.isCrouching = true;
+      s.isMoving = false;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      if (s.suppressedTimer <= 0) {
+        s.tacticalMode = 'hold_cover';
+        s.peekCycleTimer = 1.4 + Math.random() * 1.2;
+      }
+      return;
+    }
+
+    if (mustDuckAirRaid) {
+      s.isMoving = false;
+      s.isCrouching = true;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      return;
+    }
+
+    // Push forward with the player into No Man's Land houses and low walls
+    if (playerPos.z < 20 && s.tacticalMode !== 'bound') {
+      const desiredGoalZ = Math.max(-45, playerPos.z - 6);
+      if (s.pos.z > playerPos.z + 9 || (s.tacticalTimer <= 0 && s.targetPos.z > desiredGoalZ + 8)) {
+        this.cover.releaseTacticalNode(s.id);
+        const node = this.cover.findTacticalCoverNode(s.pos.x, s.pos.z, desiredGoalZ, 'ally', s.id);
+        if (node && Math.hypot(node.x - s.pos.x, node.z - s.pos.z) > 1.4) {
+          s.coverNodeId = node.id;
+          s.targetPos.set(node.x, node.y, node.z);
+          s.tacticalMode = 'bound';
+          s.isCrouching = false;
+        } else {
+          s.tacticalTimer = 2.5 + Math.random() * 2.0;
+        }
+      }
+    }
+
+    if (s.tacticalMode === 'bound') {
+      const dx = s.targetPos.x - s.pos.x;
+      const dz = s.targetPos.z - s.pos.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist < 1.35) {
+        s.tacticalMode = 'hold_cover';
+        s.isCrouching = true;
+        s.tacticalTimer = 6.0 + Math.random() * 4.5;
+        s.peekCycleTimer = 2.2 + Math.random() * 1.2;
+        s.isMoving = false;
+        s.leftLegRotX = 0;
+        s.rightLegRotX = 0;
+      } else {
+        const moveSpeed = 3.1;
+        s.pos.x += (dx / dist) * moveSpeed * dt;
+        s.pos.z += (dz / dist) * moveSpeed * dt;
+        const groundH = this.terrain.getTerrainHeight(s.pos.x, s.pos.z);
+        s.pos.y = insideBuilding ? Math.max(groundH, s.targetPos.y) : groundH;
+        s.yaw = Math.atan2(-dx, -dz);
+        s.isMoving = true;
+        s.isCrouching = false;
+        s.walkPhase += dt * moveSpeed * 3.4;
+        const swing = Math.sin(s.walkPhase) * 0.62;
+        s.leftLegRotX = swing;
+        s.rightLegRotX = -swing;
+      }
+    } else {
+      s.isMoving = false;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      s.tacticalTimer -= dt;
+      s.peekCycleTimer -= dt;
+      if (s.peekCycleTimer <= 0) {
+        if (s.tacticalMode === 'hold_cover') {
+          s.tacticalMode = 'peek_fire';
+          s.isCrouching = false;
+          s.peekCycleTimer = 2.0 + Math.random() * 1.0;
+        } else {
+          s.tacticalMode = 'hold_cover';
+          s.isCrouching = true;
+          s.peekCycleTimer = 2.2 + Math.random() * 1.2;
+        }
+      }
+    }
 
     s.allyRetargetTimer -= dt;
     if (!s.allyTarget || !s.allyTarget.alive || s.allyRetargetTimer <= 0) {
@@ -892,7 +1237,7 @@ export class SoldierSystem {
     }
 
     const targetEnemy = s.allyTarget;
-    if (targetEnemy && !airRaidActive) {
+    if (targetEnemy && !s.isCrouching) {
       const dx = targetEnemy.pos.x - s.pos.x;
       const dz = targetEnemy.pos.z - s.pos.z;
       s.yaw = Math.atan2(-dx, -dz);
@@ -913,6 +1258,135 @@ export class SoldierSystem {
     }
   }
 
+  private stepEnemyTacticalState(
+    s: Soldier,
+    dt: number,
+    allowNewBound: boolean,
+    isLod1: boolean,
+    distToPlayer: number
+  ): boolean {
+    if (s.emplaced) {
+      s.isMoving = false;
+      s.isCrouching = false;
+      s.tacticalMode = 'peek_fire';
+      return false;
+    }
+
+    if (s.suppressedTimer > 0) {
+      s.suppressedTimer -= dt;
+      s.tacticalMode = 'suppressed';
+      s.isCrouching = true;
+      s.isMoving = false;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      if (s.suppressedTimer <= 0) {
+        s.tacticalMode = 'hold_cover';
+        s.peekCycleTimer = 1.6 + Math.random() * 1.2;
+        s.tacticalTimer = Math.max(s.tacticalTimer, 2.0);
+      }
+      return false;
+    }
+
+    // Flamethrower stops bounding once in flame engagement range (< 11.5m)
+    if (s.role === 'flamethrower' && distToPlayer < 11.5) {
+      s.tacticalMode = 'peek_fire';
+      s.isCrouching = false;
+      s.isMoving = false;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      return false;
+    }
+
+    let startedNewBound = false;
+
+    if (s.tacticalMode === 'bound') {
+      const toTargetX = s.targetPos.x - s.pos.x;
+      const toTargetZ = s.targetPos.z - s.pos.z;
+      const distTargetSq = toTargetX * toTargetX + toTargetZ * toTargetZ;
+
+      if (distTargetSq < 1.35 * 1.35) {
+        s.tacticalMode = 'hold_cover';
+        s.isCrouching = true;
+        s.tacticalTimer = 6.0 + Math.random() * 4.5;
+        s.peekCycleTimer = 2.2 + Math.random() * 1.2;
+        s.isMoving = false;
+        s.leftLegRotX = 0;
+        s.rightLegRotX = 0;
+      } else {
+        const distTarget = Math.sqrt(distTargetSq);
+        const moveSpeed = s.role === 'assault' ? 3.55 : s.role === 'flamethrower' ? 3.1 : 2.75;
+        s.pos.x += (toTargetX / distTarget) * moveSpeed * dt;
+        s.pos.z += (toTargetZ / distTarget) * moveSpeed * dt;
+        if (!isLod1 || ((s.id + this.frameCounter) & 1) === 0) {
+          const groundH = this.terrain.getTerrainHeight(s.pos.x, s.pos.z);
+          if (this.cover.isInsideEnterableBuilding(s.pos.x, s.pos.z)) {
+            s.pos.y = Math.max(groundH, s.targetPos.y);
+          } else {
+            s.pos.y = groundH;
+          }
+        }
+        s.yaw = Math.atan2(-toTargetX, -toTargetZ);
+        s.isMoving = true;
+        s.isCrouching = false;
+        s.walkPhase += dt * moveSpeed * 3.4;
+        const swingAmp = s.role === 'assault' ? 0.72 : 0.62;
+        const swing = Math.sin(s.walkPhase) * swingAmp;
+        s.leftLegRotX = swing;
+        s.rightLegRotX = -swing;
+      }
+    } else {
+      // Stationary cover / house window cycle
+      s.isMoving = false;
+      s.leftLegRotX = 0;
+      s.rightLegRotX = 0;
+      s.tacticalTimer -= dt;
+      s.peekCycleTimer -= dt;
+
+      if (s.peekCycleTimer <= 0) {
+        if (s.tacticalMode === 'hold_cover') {
+          s.tacticalMode = 'peek_fire';
+          s.isCrouching = false;
+          s.peekCycleTimer = 2.0 + Math.random() * 1.0;
+        } else {
+          s.tacticalMode = 'hold_cover';
+          s.isCrouching = true;
+          s.peekCycleTimer = 2.2 + Math.random() * 1.2;
+        }
+      }
+
+      if (s.tacticalTimer <= 0) {
+        if (allowNewBound && s.pos.z < s.finalObjectiveZ - 1.8) {
+          const stepZ = Math.min(s.finalObjectiveZ, s.pos.z + 9 + Math.random() * 6);
+          this.cover.releaseTacticalNode(s.id);
+          const nextNode = this.cover.findTacticalCoverNode(s.pos.x, s.pos.z, stepZ, 'enemy', s.id);
+          if (nextNode && Math.hypot(nextNode.x - s.pos.x, nextNode.z - s.pos.z) > 1.45) {
+            s.coverNodeId = nextNode.id;
+            s.targetPos.set(nextNode.x, nextNode.y, nextNode.z);
+            s.tacticalMode = 'bound';
+            s.isCrouching = false;
+            startedNewBound = true;
+          } else if (s.pos.z < s.finalObjectiveZ - 4.0) {
+            s.coverNodeId = null;
+            s.targetPos.set(
+              THREE.MathUtils.clamp(s.pos.x + (Math.random() - 0.5) * 6, -34, 34),
+              s.pos.y,
+              stepZ
+            );
+            s.tacticalMode = 'bound';
+            s.isCrouching = false;
+            startedNewBound = true;
+          } else {
+            s.tacticalTimer = 3.5 + Math.random() * 2.5;
+          }
+        } else {
+          s.tacticalTimer = 2.0 + Math.random() * 2.0;
+        }
+      }
+    }
+
+    return startedNewBound;
+  }
+
   private updateEnemyLod0(
     s: Soldier,
     dt: number,
@@ -921,44 +1395,46 @@ export class SoldierSystem {
     playerExposure: number,
     onRadioShout: (msg: string) => void,
     peekDanger: number,
-    diffConfig: DifficultyModifier
-  ): void {
-    this.tmpEye.set(s.pos.x, s.pos.y + 1.32, s.pos.z);
+    diffConfig: DifficultyModifier,
+    allowNewBound: boolean,
+    onPlayerThermalDamage?: ((damage: number, origin: THREE.Vector3) => void) | null
+  ): boolean {
     const distToPlayer = Math.sqrt(s.distToPlayerSq);
+    const startedNewBound = this.stepEnemyTacticalState(s, dt, allowNewBound, false, distToPlayer);
+
+    this.tmpEye.set(s.pos.x, s.pos.y + (s.isCrouching ? 0.88 : 1.32), s.pos.z);
     const canSeePlayer =
       playerExposure >= 0.2 && this.cover.hasLineOfSight(this.tmpEye, playerHead);
 
-    // Movement (non-emplaced)
-    if (!s.emplaced) {
-      const toTargetX = s.targetPos.x - s.pos.x;
-      const toTargetZ = s.targetPos.z - s.pos.z;
-      const distTargetSq = toTargetX * toTargetX + toTargetZ * toTargetZ;
-
-      const shouldAdvance =
-        distTargetSq > 1.8 * 1.8 && (!canSeePlayer || s.role === 'assault' || distToPlayer > 22);
-      if (shouldAdvance) {
-        const distTarget = Math.sqrt(distTargetSq);
-        const moveSpeed = s.role === 'assault' ? 3.55 : 2.75;
-        s.pos.x += (toTargetX / distTarget) * moveSpeed * dt;
-        s.pos.z += (toTargetZ / distTarget) * moveSpeed * dt;
-        s.pos.y = this.terrain.getTerrainHeight(s.pos.x, s.pos.z);
-
-        s.isMoving = true;
-        s.walkPhase += dt * moveSpeed * 3.4;
-        const swingAmp = s.role === 'assault' ? 0.72 : 0.62;
-        const swing = Math.sin(s.walkPhase) * swingAmp;
-        s.leftLegRotX = swing;
-        s.rightLegRotX = -swing;
-      } else {
-        s.isMoving = false;
-        s.leftLegRotX = 0;
-        s.rightLegRotX = 0;
-      }
-    } else {
-      s.isMoving = false;
+    // Protected behind cover or pinned down by suppression -> hold fire while ducked
+    if (s.tacticalMode === 'suppressed' || s.tacticalMode === 'hold_cover') {
+      s.firstShotGrace = 0.35;
+      return startedNewBound;
     }
 
     const spreadMult = diffConfig.enemySpreadMult;
+
+    // Flamethrower special close-range thermal jet (penetrates shallow cover)
+    if (s.role === 'flamethrower' && distToPlayer < 11.5) {
+      const hasFlameLine = canSeePlayer || distToPlayer < 8.5;
+      if (hasFlameLine) {
+        const dx = playerPos.x - s.pos.x;
+        const dz = playerPos.z - s.pos.z;
+        s.yaw = Math.atan2(-dx, -dz);
+        s.isCrouching = false;
+        s.flameTickTimer -= dt;
+        if (s.flameTickTimer <= 0) {
+          s.flameTickTimer = 0.07;
+          const sinY = Math.sin(s.yaw);
+          const cosY = Math.cos(s.yaw);
+          this.tmpOrigin.set(s.pos.x - sinY * 0.55, s.pos.y + 1.02, s.pos.z - cosY * 0.55);
+          this.tmpDir.subVectors(playerHead, this.tmpOrigin).normalize();
+          this.vfx.spawnFlameJet(this.tmpOrigin, this.tmpDir);
+          onPlayerThermalDamage?.(22 * diffConfig.enemyDamageMult * 0.07, this.tmpOrigin);
+        }
+        return startedNewBound;
+      }
+    }
 
     if (canSeePlayer && s.canFocusPlayer) {
       const dx = playerPos.x - s.pos.x;
@@ -1021,10 +1497,14 @@ export class SoldierSystem {
         this.fireEnemyShot(s, this.tmpEye, this.tmpDir, 0.16 * spreadMult, playerPos.x, distToPlayer);
       }
     } else {
-      s.yaw = Math.PI;
+      if (s.tacticalMode !== 'bound') {
+        s.yaw = Math.PI;
+      }
       s.firstShotGrace = 0.35;
       this.fireSuppressiveVolley(s, dt, playerPos, playerHead, spreadMult, distToPlayer, false);
     }
+
+    return startedNewBound;
   }
 
   private updateEnemyLod1(
@@ -1032,44 +1512,23 @@ export class SoldierSystem {
     dt: number,
     playerPos: THREE.Vector3,
     playerHead: THREE.Vector3,
-    diffConfig: DifficultyModifier
-  ): void {
-    // Advance along No Man's Land with terrain height sampled every 2 frames per soldier
-    if (!s.emplaced) {
-      const toTargetX = s.targetPos.x - s.pos.x;
-      const toTargetZ = s.targetPos.z - s.pos.z;
-      const distTargetSq = toTargetX * toTargetX + toTargetZ * toTargetZ;
+    diffConfig: DifficultyModifier,
+    allowNewBound: boolean
+  ): boolean {
+    const distToPlayer = Math.sqrt(s.distToPlayerSq);
+    const startedNewBound = this.stepEnemyTacticalState(s, dt, allowNewBound, true, distToPlayer);
 
-      if (distTargetSq > 1.8 * 1.8) {
-        const distTarget = Math.sqrt(distTargetSq);
-        const moveSpeed = s.role === 'assault' ? 3.55 : 2.75;
-        s.pos.x += (toTargetX / distTarget) * moveSpeed * dt;
-        s.pos.z += (toTargetZ / distTarget) * moveSpeed * dt;
-
-        if (((s.id + this.frameCounter) & 1) === 0) {
-          s.pos.y = this.terrain.getTerrainHeight(s.pos.x, s.pos.z);
-        }
-
-        s.isMoving = true;
-        s.walkPhase += dt * moveSpeed * 3.4;
-        const swingAmp = s.role === 'assault' ? 0.72 : 0.62;
-        const swing = Math.sin(s.walkPhase) * swingAmp;
-        s.leftLegRotX = swing;
-        s.rightLegRotX = -swing;
-      } else {
-        s.isMoving = false;
-        s.leftLegRotX = 0;
-        s.rightLegRotX = 0;
-      }
-    } else {
-      s.isMoving = false;
+    if (s.tacticalMode === 'suppressed' || s.tacticalMode === 'hold_cover') {
+      s.firstShotGrace = 0.35;
+      return startedNewBound;
     }
 
-    s.yaw = Math.PI;
+    if (s.tacticalMode !== 'bound') {
+      s.yaw = Math.PI;
+    }
     s.firstShotGrace = 0.35;
 
     this.tmpEye.set(s.pos.x, s.pos.y + 1.32, s.pos.z);
-    const distToPlayer = Math.sqrt(s.distToPlayerSq);
     this.fireSuppressiveVolley(
       s,
       dt,
@@ -1079,6 +1538,7 @@ export class SoldierSystem {
       distToPlayer,
       true
     );
+    return startedNewBound;
   }
 
   private fireSuppressiveVolley(

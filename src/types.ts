@@ -1,9 +1,25 @@
 import * as THREE from 'three';
 
-export type WeaponId = 'rifle' | 'smg' | 'bazooka' | 'grenade';
+export type WeaponId =
+  | 'rifle'
+  | 'smg'
+  | 'shotgun'
+  | 'sniper'
+  | 'lmg'
+  | 'pistol'
+  | 'bazooka'
+  | 'grenade';
+export type PrimaryWeaponId = 'rifle' | 'smg' | 'shotgun' | 'sniper' | 'lmg';
+export type SecondaryWeaponId = 'pistol' | 'smg' | 'rifle';
+
+export interface PlayerLoadout {
+  primary: PrimaryWeaponId;
+  secondary: SecondaryWeaponId;
+}
+
 export type CoverState = 'dugout' | 'sheltered' | 'peeking' | 'exposed';
-export type SoldierRole = 'rifleman' | 'assault' | 'grenadier' | 'mg_gunner' | 'officer';
-export type MissionId = 0 | 1 | 2 | 3;
+export type SoldierRole = 'rifleman' | 'assault' | 'grenadier' | 'mg_gunner' | 'officer' | 'flamethrower';
+export type MissionId = 0 | 1 | 2 | 3 | 4 | 5 | 99;
 export type QualityLevel = 'low' | 'medium' | 'high';
 export type DifficultyLevel = 'recruit' | 'veteran' | 'infernal';
 export type TouchControlMode = 'auto' | 'on' | 'off';
@@ -35,6 +51,8 @@ export interface PlayerCheckpointSnapshot {
   magAmmo: Record<WeaponId, number>;
   reserveAmmo: Record<WeaponId, number>;
   smokeGrenades?: number;
+  primaryWeapon?: PrimaryWeaponId;
+  secondaryWeapon?: SecondaryWeaponId;
 }
 
 export interface SmokeCloud {
@@ -107,6 +125,20 @@ export interface BuildingSpec {
   h: number;
   d: number;
   rotY: number;
+  enterable?: boolean;
+  kind?: 'house' | 'shed' | 'outpost';
+}
+
+export interface TacticalCoverNode {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  insideBuilding?: boolean;
+  windowDirZ?: number;
+  buildingId?: string;
+  occupiedById?: number | null;
 }
 
 export interface TreePropSpec {
@@ -162,7 +194,14 @@ export interface EmplacementSpec {
   faction: 'ally' | 'enemy';
 }
 
-export type InteractableKind = 'ammo_crate' | 'medic_crate' | 'mg_mount' | 'radio' | 'bunker_charge';
+export type InteractableKind =
+  | 'ammo_crate'
+  | 'medic_crate'
+  | 'mg_mount'
+  | 'radio'
+  | 'bunker_charge'
+  | 'weapon_drop'
+  | 'ally_tank';
 
 export interface InteractablePoint {
   id: string;
@@ -173,6 +212,16 @@ export interface InteractablePoint {
   label: string;
   radius: number;
   active: boolean;
+  weaponDropId?: WeaponId;
+}
+
+export interface TroopCarSpawnSpec {
+  x: number;
+  z: number;
+  dropX: number;
+  dropZ: number;
+  passengers: number;
+  roles?: SoldierRole[];
 }
 
 export interface MissionPhase {
@@ -189,11 +238,17 @@ export interface MissionPhase {
     | 'reach_zone'
     | 'clear_trench'
     | 'plant_charge'
-    | 'detonate_wait';
+    | 'detonate_wait'
+    | 'tank_assault'
+    | 'survival_endless';
   enemiesToSpawn?: number;
   enemyRoles?: SoldierRole[];
   tanksToSpawn?: Array<{ x: number; z: number; heavy: boolean; waypoints: Array<{ x: number; z: number }> }>;
+  troopCarsToSpawn?: TroopCarSpawnSpec[];
   bomberWaves?: number;
+  strafingWaves?: number;
+  mortarZeroing?: boolean;
+  spawnAllyTank?: { x: number; z: number };
   artilleryRate?: number;
   durationSeconds?: number;
   targetZone?: { x: number; z: number; radius: number };
@@ -252,6 +307,8 @@ export interface MissionConfig {
   interactables: InteractablePoint[];
   allyCount: number;
   phases: MissionPhase[];
+  isSurvival?: boolean;
+  allyTankSpawn?: { x: number; z: number };
 }
 
 export interface DamageIndicator {
@@ -321,6 +378,26 @@ export interface HUDState {
   touchActive: boolean;
   smokeGrenades: number;
   inSmokeScreen: boolean;
+  primaryWeaponId: PrimaryWeaponId;
+  secondaryWeaponId: SecondaryWeaponId;
+  binocularsActive: boolean;
+  artilleryCallCooldown: number;
+  artilleryCallReady: boolean;
+  meleeCooldown: number;
+  sniperScopeActive: boolean;
+  inAllyTank: boolean;
+  allyTankHp: number;
+  allyTankMaxHp: number;
+  allyTankShellCooldown: number;
+  mortarWarning: string | null;
+  survivalWave: number;
+  isSurvival: boolean;
+}
+
+export interface SurvivalRecord {
+  bestWave: number;
+  bestKills: number;
+  bestTimeSec: number;
 }
 
 export interface GameSettings {
