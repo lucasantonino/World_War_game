@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { AudioEngine } from '../engine/AudioEngine';
 import { getDifficultyConfig } from '../engine/DifficultyConfig';
 import { InputManager } from '../engine/InputManager';
+import { DamageSystem } from '../gameplay/combat/DamageSystem';
 import {
   CoverState,
   DamageIndicator,
@@ -11,7 +12,9 @@ import {
   PlayerLoadout,
   PrimaryWeaponId,
   SecondaryWeaponId,
-  WeaponId
+  SquadCommandType,
+  WeaponId,
+  WoundLevel
 } from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
@@ -215,9 +218,14 @@ export class PlayerController {
   public artilleryCallCooldown = 0;
   public sniperScopeActive = false;
   public inAllyTank = false;
+  public squadMenuOpen = false;
+  public woundLevel: WoundLevel = 'none';
 
   public onMeleeRequested: ((origin: THREE.Vector3, forward: THREE.Vector3) => void) | null = null;
   public onCallArtilleryRequested: ((origin: THREE.Vector3, dir: THREE.Vector3) => void) | null = null;
+  public onSquadOrderRequested: ((type: SquadCommandType, targetPos?: THREE.Vector3) => void) | null = null;
+
+  private damageSystem = new DamageSystem();
 
   public cookingGrenade = false;
   public cookTimer = 0;
@@ -319,6 +327,8 @@ export class PlayerController {
     this.artilleryCallCooldown = 0;
     this.sniperScopeActive = false;
     this.inAllyTank = false;
+    this.squadMenuOpen = false;
+    this.woundLevel = 'none';
 
     this.cookingGrenade = false;
     this.cookTimer = 0;
@@ -387,6 +397,7 @@ export class PlayerController {
 
   public enterAllyTank(): void {
     this.inAllyTank = true;
+    this.squadMenuOpen = false;
     this.isCrouching = false;
     this.isSprinting = false;
     this.mgMounted = false;
@@ -553,6 +564,44 @@ export class PlayerController {
     if (causeBleed && this.hp > 0 && this.hp < 78) {
       this.bleeding = true;
     }
+    if (this.hp <= 0) {
+      this.squadMenuOpen = false;
+      this.woundLevel = 'incapacitated';
+    } else {
+      const damageType =
+        cause.includes('canhão') || cause.includes('Artilharia') || cause.includes('aérea')
+          ? 'shell'
+          : cause.includes('Granada') || cause.includes('Morteiro')
+            ? 'explosion'
+            : cause.includes('chamas') || cause.includes('Lança-chamas')
+              ? 'fire'
+              : 'bullet';
+      const dmgResult = this.damageSystem.resolveDamage({
+        sourceId: 'enemy',
+        targetId: 'player',
+        damageType,
+        baseDamage: finalDamage,
+        impactPosition: { x: this.pos.x, y: this.getEyeY(), z: this.pos.z },
+        hitZone: 'torso',
+        distance: Math.min(25, this.pos.distanceTo(sourcePos)),
+        material: 'flesh',
+        targetCoverFactor: 0
+      });
+      const rank: Record<WoundLevel, number> = {
+        none: 0,
+        light: 1,
+        moderate: 2,
+        severe: 3,
+        incapacitated: 4
+      };
+      let nextWound = dmgResult.woundLevel;
+      if (this.bleeding && rank[nextWound] < rank.moderate) {
+        nextWound = this.hp < 40 ? 'severe' : 'moderate';
+      }
+      if (rank[nextWound] > rank[this.woundLevel]) {
+        this.woundLevel = nextWound;
+      }
+    }
     this.addShake(Math.min(0.65, finalDamage / 45));
 
     const dx = sourcePos.x - this.pos.x;
@@ -587,6 +636,7 @@ export class PlayerController {
     this.bandages = Math.max(this.bandages, 3);
     this.hp = Math.min(this.maxHp, this.hp + 30);
     this.bleeding = false;
+    this.woundLevel = 'none';
     this.audio.playUiClick();
   }
 
@@ -717,6 +767,14 @@ export class PlayerController {
     // Bayonet / Melee [V]
     if (this.input.consumeKeyPress('KeyV') && onMelee) {
       this.triggerMelee(onMelee);
+    }
+
+    // Squad quick-order menu toggle [Z]
+    if (this.mgMounted || this.hp <= 0) {
+      this.squadMenuOpen = false;
+    } else if (this.input.consumeKeyPress('KeyZ')) {
+      this.squadMenuOpen = !this.squadMenuOpen;
+      this.audio.playUiClick();
     }
 
     const moveIn = this.input.getMovementInput();
@@ -880,6 +938,8 @@ export class PlayerController {
       this.hp -= 4.2 * dt;
       if (this.hp <= 0) {
         this.hp = 0;
+        this.squadMenuOpen = false;
+        this.woundLevel = 'incapacitated';
         this.lastDamageCause = 'Hemorragia fatal sem aplicar curativo';
       }
     }
@@ -921,6 +981,7 @@ export class PlayerController {
         this.touchAutoBandaging = false;
         this.bandages--;
         this.bleeding = false;
+        this.woundLevel = 'none';
         this.hp = Math.min(this.maxHp, this.hp + 38);
         this.audio.playUiClick();
       }
@@ -929,8 +990,38 @@ export class PlayerController {
       this.touchAutoBandaging = false;
     }
 
-    // 7. Weapon switching & Reloading
-    if (!this.mgMounted && this.bandagingProgress <= 0 && !this.cookingGrenade) {
+    // 7. Squad Quick Orders [Z + 1-4] & Weapon switching / Reloading
+    if (this.squadMenuOpen && !this.mgMounted && !this.inAllyTank && this.hp > 0) {
+      let issuedOrder: SquadCommandType | null = null;
+      if (this.input.consumeKeyPress('Digit1')) issuedOrder = 'advance';
+      else if (this.input.consumeKeyPress('Digit2')) issuedOrder = 'hold';
+      else if (this.input.consumeKeyPress('Digit3')) issuedOrder = 'flank';
+      else if (this.input.consumeKeyPress('Digit4')) issuedOrder = 'regroup';
+
+      if (issuedOrder) {
+        let targetPos: THREE.Vector3;
+        if (issuedOrder === 'advance' || issuedOrder === 'flank') {
+          const origin = this.camera.position;
+          const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+          const hit = this.cover.raycastWorld(origin, dir, 65, true);
+          if (hit) {
+            targetPos = hit.point.clone();
+          } else {
+            targetPos = new THREE.Vector3(
+              THREE.MathUtils.clamp(origin.x + dir.x * 24, -44, 44),
+              this.pos.y,
+              THREE.MathUtils.clamp(origin.z + dir.z * 24, -72, 48)
+            );
+            targetPos.y = this.terrain.getTerrainHeight(targetPos.x, targetPos.z);
+          }
+        } else {
+          targetPos = this.pos.clone();
+        }
+        this.squadMenuOpen = false;
+        this.audio.playUiClick();
+        this.onSquadOrderRequested?.(issuedOrder, targetPos);
+      }
+    } else if (!this.mgMounted && this.bandagingProgress <= 0 && !this.cookingGrenade) {
       if (this.input.consumeKeyPress('Digit1')) this.switchWeapon(this.primaryWeapon);
       else if (this.input.consumeKeyPress('Digit2')) this.switchWeapon(this.secondaryWeapon);
       else if (this.input.consumeKeyPress('Digit3')) this.switchWeapon('bazooka');
@@ -1035,6 +1126,7 @@ export class PlayerController {
             this.resupplyMedic();
           } else if (bestInter.kind === 'mg_mount') {
             this.mgMounted = true;
+            this.squadMenuOpen = false;
             this.isCrouching = false;
             this.binocularsActive = false;
             this.viewModel.setBinocularsActive(false);

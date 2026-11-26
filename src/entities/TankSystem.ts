@@ -1,7 +1,10 @@
 import * as THREE from 'three';
+import type { EventBus } from '../core/EventBus';
+import type { HitZone, VehicleSubsystem } from '../core/types';
 import { AudioEngine } from '../engine/AudioEngine';
 import { getDifficultyConfig } from '../engine/DifficultyConfig';
 import { getProceduralTextures } from '../engine/Textures';
+import { VehicleDamageSystem, type VehicleSubsystemsState } from '../gameplay/vehicles/VehicleDamage';
 import { DifficultyModifier, SoldierRole, TroopCarSpawnSpec } from '../types';
 import { CoverSystem, TankHullCollider } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
@@ -31,6 +34,7 @@ export interface TankEntity {
   mgBurstCount: number;
   barrelRecoil: number;
   smokeTimer: number;
+  subsystems: VehicleSubsystemsState;
 }
 
 export interface TroopCarEntity {
@@ -90,6 +94,10 @@ export class TankSystem {
   public troopCars: TroopCarEntity[] = [];
   private allyTank: AllyTankEntity | null = null;
   private nextId = 1;
+  private vehicleDamage = new VehicleDamageSystem();
+  public onSubsystemDamaged:
+    | ((tank: TankEntity, subsystem: VehicleSubsystem, state: VehicleSubsystemsState) => void)
+    | null = null;
 
   // Reusable math temporaries (zero per-frame allocations)
   private tmpPlayerHead = new THREE.Vector3();
@@ -117,6 +125,10 @@ export class TankSystem {
     this.projectiles = projectiles;
     this.vfx = vfx;
     this.audio = audio;
+  }
+
+  public setEventBus(bus: EventBus): void {
+    this.vehicleDamage = new VehicleDamageSystem(bus);
   }
 
   public clear(): void {
@@ -373,7 +385,8 @@ export class TankSystem {
     root.position.set(x, y, z);
     this.scene.add(root);
 
-    const maxHp = heavy ? 130 : 100;
+    const subsystems = this.vehicleDamage.createTankState(heavy);
+    const maxHp = subsystems.maxHullHp;
     const tank: TankEntity = {
       id: `tank_${this.nextId++}`,
       heavy,
@@ -394,7 +407,8 @@ export class TankSystem {
       mgCooldown: 0.4,
       mgBurstCount: 0,
       barrelRecoil: 0,
-      smokeTimer: 0
+      smokeTimer: 0,
+      subsystems
     };
 
     this.tanks.push(tank);
@@ -1084,21 +1098,40 @@ export class TankSystem {
 
       if (t.destroyed) return true;
 
-      // Determine directional armor damage (rear = 100, flank = 70, front = 48)
+      // Determine directional hitZone (tracks on lower hull / flanks, turret on upper hull, front/rear/side)
       const fwdX = -Math.sin(t.hullYaw);
       const fwdZ = -Math.cos(t.hullYaw);
       this.tmpToHit.set(dx, dz).normalize();
       const dot = fwdX * this.tmpToHit.x + fwdZ * this.tmpToHit.y;
+      const relY = point.y - t.pos.y;
 
-      let dmg = 70;
-      if (dot > 0.45) {
-        dmg = 48; // Thick front glacis
+      let hitZone: HitZone = 'armor_side';
+      if (relY <= 1.15 * scale && dot <= 0.55) {
+        hitZone = 'tracks';
+      } else if (relY >= 1.48 * scale) {
+        hitZone = 'turret';
+      } else if (dot > 0.45) {
+        hitZone = 'armor_front';
       } else if (dot < -0.45) {
-        dmg = 110; // Exposed rear engine grille
+        hitZone = 'armor_rear';
       }
 
-      t.hp -= dmg;
-      if (t.hp <= 0) {
+      const result = this.vehicleDamage.applyHit(t.id, 'enemy', t.subsystems, {
+        sourceId: 'player',
+        targetId: t.id,
+        damageType: 'shell',
+        baseDamage: 240,
+        impactPosition: { x: point.x, y: point.y, z: point.z },
+        hitZone,
+        distance: 25,
+        material: 'steel_heavy'
+      });
+
+      t.hp = t.subsystems.hullHp;
+      if (result.subsystemDamaged) {
+        this.onSubsystemDamaged?.(t, result.subsystemDamaged, t.subsystems);
+      }
+      if (t.subsystems.state === 'destroyed' || t.hp <= 0) {
         this.destroyTank(t);
         onDestroyed?.(t);
       }
@@ -1134,9 +1167,32 @@ export class TankSystem {
       if (t.destroyed) continue;
       const d = t.pos.distanceTo(center);
       if (d <= radius) {
-        const dmg = maxDamage * (1 - (d / radius) * 0.5);
-        t.hp -= dmg;
-        if (t.hp <= 0) {
+        const dx = center.x - t.pos.x;
+        const dz = center.z - t.pos.z;
+        const distXZ = Math.max(0.01, Math.hypot(dx, dz));
+        const fwdX = -Math.sin(t.hullYaw);
+        const fwdZ = -Math.cos(t.hullYaw);
+        const dot = (fwdX * dx + fwdZ * dz) / distXZ;
+        const relY = center.y - t.pos.y;
+        const hitZone: HitZone =
+          relY <= 1.25 ? 'tracks' : dot > 0.45 ? 'armor_front' : dot < -0.45 ? 'armor_rear' : 'armor_side';
+
+        const falloff = 1 - (d / radius) * 0.5;
+        const result = this.vehicleDamage.applyHit(t.id, 'enemy', t.subsystems, {
+          sourceId: 'explosion',
+          targetId: t.id,
+          damageType: 'explosion',
+          baseDamage: Math.max(60, maxDamage * 1.45 * falloff),
+          impactPosition: { x: center.x, y: center.y, z: center.z },
+          hitZone,
+          distance: d,
+          material: 'steel_heavy'
+        });
+        t.hp = t.subsystems.hullHp;
+        if (result.subsystemDamaged) {
+          this.onSubsystemDamaged?.(t, result.subsystemDamaged, t.subsystems);
+        }
+        if (t.subsystems.state === 'destroyed' || t.hp <= 0) {
           this.destroyTank(t);
           onDestroyed?.(t);
         }
@@ -1183,6 +1239,8 @@ export class TankSystem {
   private destroyTank(t: TankEntity): void {
     t.destroyed = true;
     t.hp = 0;
+    t.subsystems.hullHp = 0;
+    t.subsystems.state = 'destroyed';
     t.turret.rotation.z = 0.24;
     t.turret.position.y += 0.22;
     t.hull.traverse((obj) => {
@@ -1384,8 +1442,9 @@ export class TankSystem {
         continue;
       }
 
-      // 1. Move along waypoints
-      if (t.waypointIndex < t.waypoints.length) {
+      // 1. Move along waypoints (only if tracks & engine are operational)
+      const canMove = this.vehicleDamage.canMove(t.subsystems);
+      if (canMove && t.waypointIndex < t.waypoints.length) {
         const wp = t.waypoints[t.waypointIndex];
         const dx = wp.x - t.pos.x;
         const dz = wp.z - t.pos.z;
@@ -1406,6 +1465,14 @@ export class TankSystem {
           this.cover.destroyWiresInRadius(t.pos.x, t.pos.z, 2.4);
           this.cover.crushByTank(t.pos, 2.85 * (t.heavy ? 1.18 : 0.96));
         }
+      } else if (!canMove || t.subsystems.state === 'disabled') {
+        t.smokeTimer -= dt;
+        if (t.smokeTimer <= 0) {
+          t.smokeTimer = 0.42;
+          this.tmpSmokePos.set(t.pos.x, t.pos.y + 1.35, t.pos.z + 1.4);
+          this.tmpSmokeVel.set((Math.random() - 0.5) * 0.5, 1.8, (Math.random() - 0.5) * 0.5);
+          this.vfx.spawnSprite(this.tmpSmokePos, this.tmpSmokeVel, 0x2b2927, 0.9, 2.6, 1.4, 0.5, -0.15);
+        }
       }
 
       // Ground conformance (pitch / roll over craters)
@@ -1424,14 +1491,18 @@ export class TankSystem {
         Math.min(1, dt * 6)
       );
 
-      // 2. Turret tracking toward player
-      const dxP = playerPos.x - t.pos.x;
-      const dzP = playerPos.z - t.pos.z;
-      const desiredTurretWorldYaw = Math.atan2(-dxP, -dzP);
-      const desiredLocalYaw = desiredTurretWorldYaw - t.hullYaw;
-      const curLocal = t.turret.rotation.y;
-      const dYaw = Math.atan2(Math.sin(desiredLocalYaw - curLocal), Math.cos(desiredLocalYaw - curLocal));
-      t.turret.rotation.y += THREE.MathUtils.clamp(dYaw, -dt * 0.95, dt * 0.95);
+      // 2. Turret tracking toward player (scaled by turret subsystem health)
+      const turretSpeedMult = this.vehicleDamage.getTurretSpeedMult(t.subsystems);
+      if (turretSpeedMult > 0) {
+        const dxP = playerPos.x - t.pos.x;
+        const dzP = playerPos.z - t.pos.z;
+        const desiredTurretWorldYaw = Math.atan2(-dxP, -dzP);
+        const desiredLocalYaw = desiredTurretWorldYaw - t.hullYaw;
+        const curLocal = t.turret.rotation.y;
+        const dYaw = Math.atan2(Math.sin(desiredLocalYaw - curLocal), Math.cos(desiredLocalYaw - curLocal));
+        const maxTurretStep = dt * 0.95 * turretSpeedMult;
+        t.turret.rotation.y += THREE.MathUtils.clamp(dYaw, -maxTurretStep, maxTurretStep);
+      }
       t.turretYaw = t.hullYaw + t.turret.rotation.y;
 
       // Barrel recoil recovery
@@ -1439,7 +1510,11 @@ export class TankSystem {
       const scale = t.heavy ? 1.18 : 0.96;
       t.barrel.position.z = -2.1 * scale + t.barrelRecoil;
 
-      // 3. Fire Cannon & Coaxial MG
+      // 3. Fire Cannon & Coaxial MG (only if turret/cannon operational)
+      const canFireCannon =
+        t.subsystems.turretHp > 0 && t.subsystems.cannonHp > 0 && t.subsystems.crewAlive > 0;
+      const canFireMg = t.subsystems.turretHp > 0 && t.subsystems.crewAlive > 0;
+
       this.tmpMuzzle.set(
         t.pos.x - Math.sin(t.turretYaw) * 3.4 * scale,
         t.pos.y + 1.65 * scale,
@@ -1449,7 +1524,7 @@ export class TankSystem {
       const pan = Math.max(-1, Math.min(1, (t.pos.x - playerPos.x) / 30));
 
       t.cannonCooldown -= dt;
-      if (t.cannonCooldown <= 0 && distPlayer < 65) {
+      if (canFireCannon && t.cannonCooldown <= 0 && distPlayer < 65) {
         t.cannonCooldown = t.heavy ? 5.2 : 6.0;
         const aimDirectly = playerExposure > 0.6 || (playerExposure > 0.3 && peekDanger >= 0.6);
         if (aimDirectly) {
@@ -1477,7 +1552,7 @@ export class TankSystem {
 
       // Coaxial MG bursts when player is exposed
       t.mgCooldown -= dt;
-      if (playerExposure > 0.28 && t.mgCooldown <= 0 && distPlayer < 55) {
+      if (canFireMg && playerExposure > 0.28 && t.mgCooldown <= 0 && distPlayer < 55) {
         if (this.cover.hasLineOfSight(this.tmpMuzzle, this.tmpPlayerHead)) {
           t.mgCooldown = 0.11;
           this.tmpDir.copy(this.tmpPlayerHead).sub(this.tmpMuzzle).normalize();

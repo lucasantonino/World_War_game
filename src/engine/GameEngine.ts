@@ -4,12 +4,17 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { GameApplication } from '../core/GameApplication';
 import { BomberSystem } from '../entities/BomberSystem';
 import { PlayerController, WEAPON_STATS } from '../entities/PlayerController';
 import { ProjectileSystem } from '../entities/ProjectileSystem';
 import { SoldierSystem } from '../entities/SoldierSystem';
 import { TankSystem } from '../entities/TankSystem';
 import { VFXSystem } from '../entities/VFXSystem';
+import { SquadCommandSystem } from '../gameplay/squads/SquadCommandSystem';
+import { SquadCommunication } from '../gameplay/squads/SquadCommunication';
+import { SquadSystem } from '../gameplay/squads/SquadSystem';
+import { CampaignManager } from '../missions/CampaignManager';
 import { UIManager } from '../ui/UIManager';
 import {
   GameScreen,
@@ -22,8 +27,10 @@ import {
   PlayerCheckpointSnapshot,
   PlayerLoadout,
   PrimaryWeaponId,
+  RadioChannel,
   SecondaryWeaponId,
   SoldierRole,
+  SquadCommandType,
   SurvivalRecord,
   WeaponId
 } from '../types';
@@ -158,7 +165,25 @@ export class GameEngine {
   private wasInMission = false;
   private tmpTankCamPos = new THREE.Vector3();
 
+  private app: GameApplication;
+  private squadSystem: SquadSystem;
+  private squadCommands: SquadCommandSystem;
+  private squadComms: SquadCommunication;
+  private campaignManager: CampaignManager;
+  private radioChannel: RadioChannel = 'command';
+  private radioDegraded = false;
+  private squadActiveCommand: SquadCommandType = 'hold';
+  private squadStepAccumDt = 0;
+  private sectorsCapturedCount = 0;
+  private reportedDisabledSubsystems = new Set<string>();
+  private medicRadioCooldown = 0;
+
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
+    this.app = new GameApplication();
+    this.squadSystem = new SquadSystem(this.app.world, this.app.bus);
+    this.squadCommands = new SquadCommandSystem(this.app.world, this.app.bus);
+    this.squadComms = new SquadCommunication(this.app.world, this.app.bus);
+    this.campaignManager = new CampaignManager(this.app.saves, this.app.bus);
     this.settings = this.loadSettings();
     this.completedMissions = this.loadCompleted();
     this.unlockedWeapons = this.loadUnlocks();
@@ -208,6 +233,9 @@ export class GameEngine {
     );
     this.player.onMeleeRequested = (origin, forward) => this.handlePlayerMelee(origin, forward);
     this.player.onCallArtilleryRequested = (origin, dir) => this.handleArtilleryCall(origin, dir);
+    this.player.onSquadOrderRequested = (type, targetPos) => {
+      this.issuePlayerSquadOrder(type, targetPos);
+    };
 
     this.soldiers = new SoldierSystem(
       this.scene,
@@ -222,6 +250,20 @@ export class GameEngine {
         this.maybeSpawnWeaponDrop(pos, role);
       }
     });
+    this.soldiers.setOnPlayerHealedByMedic((amount) => {
+      this.player.hp = Math.min(this.player.maxHp, this.player.hp + amount);
+      this.player.bleeding = false;
+      this.player.woundLevel = this.player.hp >= 82 ? 'none' : 'light';
+      this.audio.playUiClick();
+      if (this.medicRadioCooldown <= 0) {
+        this.medicRadioCooldown = 6.0;
+        this.pushRadioCaption(
+          'Soldado 05 Médico: "Curativo aplicado e hemorragia estancada! Aguente firme!"',
+          'squad',
+          this.radioDegraded
+        );
+      }
+    });
 
     this.tanks = new TankSystem(
       this.scene,
@@ -231,7 +273,27 @@ export class GameEngine {
       this.vfx,
       this.audio
     );
+    this.tanks.setEventBus(this.app.bus);
+    this.tanks.onSubsystemDamaged = (tank, subsystem, state) => {
+      const key = `${tank.id}:${subsystem}`;
+      if (this.reportedDisabledSubsystems.has(key)) return;
+      if (subsystem === 'tracks' && state.tracksHp <= 0) {
+        this.reportedDisabledSubsystems.add(key);
+        this.pushRadioCaption('Esteiras do blindado inimigo destruídas! Tanque imobilizado!', 'operational');
+      } else if (subsystem === 'turret' && state.turretHp <= 0) {
+        this.reportedDisabledSubsystems.add(key);
+        this.pushRadioCaption('Torre do blindado inimigo travada!', 'operational');
+      } else if (subsystem === 'cannon' && state.cannonHp <= 0) {
+        this.reportedDisabledSubsystems.add(key);
+        this.pushRadioCaption('Canhão do tanque inimigo inutilizado!', 'operational');
+      } else if (subsystem === 'engine' && state.engineHp <= 0) {
+        this.reportedDisabledSubsystems.add(key);
+        this.pushRadioCaption('Motor do blindado inimigo destruído! Veículo imobilizado!', 'operational');
+      }
+    };
     this.bombers = new BomberSystem(this.scene, this.projectiles, this.vfx, this.audio);
+
+    this.bindSimulationBusEvents();
 
     this.activeMission = getMissionConfig(0);
 
@@ -348,6 +410,15 @@ export class GameEngine {
     this.ui.onTouchBinoculars = () => {
       this.player.toggleBinoculars();
     };
+    this.ui.onIssueSquadOrder = (type) => {
+      this.handleUiSquadOrder(type);
+    };
+    this.ui.onToggleSquadMenu = () => {
+      if (this.screen === 'playing' && !this.player.inAllyTank && !this.player.mgMounted && this.player.hp > 0) {
+        this.player.squadMenuOpen = !this.player.squadMenuOpen;
+        this.audio.playUiClick();
+      }
+    };
 
     this.ui.setArsenalState(this.unlockedWeapons, this.loadout);
     this.ui.setSurvivalRecord(this.survivalRecord);
@@ -451,9 +522,197 @@ export class GameEngine {
 
   private pauseGameplay(): void {
     if (this.screen === 'playing') {
+      this.player.squadMenuOpen = false;
       this.screen = 'paused';
       this.input.setGameplayActive(false);
       this.ui.setScreen('paused');
+    }
+  }
+
+  private bindSimulationBusEvents(): void {
+    this.app.bus.on('sector.captured', (ev) => {
+      if (this.screen !== 'playing') return;
+      if (ev.payload.faction === 'ally') {
+        this.sectorsCapturedCount++;
+      }
+      const sector = this.app.world.sectors.find((s) => s.id === ev.payload.sectorId);
+      const label = sector?.name ?? ev.payload.sectorId;
+      const msg =
+        ev.payload.faction === 'ally'
+          ? `Setor ${label} assegurado pelas forças aliadas!`
+          : `Alerta: forças inimigas retomaram ${label}!`;
+      this.pushRadioCaption(msg, 'command', this.radioDegraded);
+    });
+
+    this.app.bus.on('sector.contested', (ev) => {
+      if (this.screen !== 'playing') return;
+      const sector = this.app.world.sectors.find((s) => s.id === ev.payload.sectorId);
+      const label = sector?.name ?? ev.payload.sectorId;
+      this.pushRadioCaption(`Combate intenso em ${label}!`, 'operational', this.radioDegraded);
+    });
+
+    this.app.bus.on('battlefield.event.triggered', (ev) => {
+      if (this.screen !== 'playing') return;
+      this.pushRadioCaption(
+        `${ev.payload.title}: ${ev.payload.description}`,
+        ev.payload.channel,
+        this.radioDegraded
+      );
+    });
+
+    this.app.bus.on('vehicle.disabled', (ev) => {
+      if (this.screen !== 'playing') return;
+      if (!this.reportedDisabledSubsystems.has(`${ev.payload.vehicleId}:tracks`)) {
+        this.pushRadioCaption('Veículo blindado neutralizado no setor!', 'operational', this.radioDegraded);
+      }
+    });
+
+    this.app.bus.on('radio.message.sent', (ev) => {
+      if (this.screen !== 'playing') return;
+      this.pushRadioCaption(
+        `${ev.payload.sender}: ${ev.payload.text}`,
+        ev.payload.channel,
+        ev.payload.degraded
+      );
+    });
+  }
+
+  private initializeSimulationForMission(id: MissionId, applyCampaignBonuses: boolean): void {
+    this.app.initializeMission(id);
+
+    // Substitui o pelotão genérico do diretor pelo pelotão do jogador (Soldado 01..07)
+    const oldPlayerSquad = this.app.world.squads.get('squad-player');
+    if (oldPlayerSquad) {
+      for (const memberId of oldPlayerSquad.memberIds) {
+        this.app.world.soldiers.delete(memberId);
+      }
+      this.app.world.squads.delete('squad-player');
+    }
+
+    this.squadSystem.spawnDefaultPlayerSquad({
+      x: this.player.pos.x,
+      y: this.player.pos.y,
+      z: this.player.pos.z
+    });
+
+    this.squadActiveCommand = 'hold';
+    this.squadStepAccumDt = 0;
+    this.sectorsCapturedCount = 0;
+    this.reportedDisabledSubsystems.clear();
+    this.medicRadioCooldown = 0;
+    this.radioChannel = 'command';
+    this.radioDegraded = false;
+
+    if (applyCampaignBonuses) {
+      const campaignState = this.campaignManager.getState();
+      if (campaignState.ammoBonus > 0) {
+        const extraRounds = Math.min(90, Math.max(8, Math.round(campaignState.ammoBonus * 0.25)));
+        this.player.reserveAmmo.rifle += Math.ceil(extraRounds * 0.5);
+        this.player.reserveAmmo.smg += extraRounds;
+        this.player.reserveAmmo.lmg += extraRounds;
+        this.player.reserveAmmo.shotgun += Math.ceil(extraRounds * 0.3);
+        this.player.reserveAmmo.sniper += Math.ceil(extraRounds * 0.25);
+        this.player.reserveAmmo.bazooka += Math.min(3, Math.floor(campaignState.ammoBonus / 80));
+        this.player.reserveAmmo.grenade += Math.min(2, Math.floor(campaignState.ammoBonus / 100));
+      }
+      if (campaignState.supportLevel > 1) {
+        this.player.bandages = Math.min(5, this.player.bandages + Math.floor(campaignState.supportLevel / 3));
+      }
+    }
+  }
+
+  private isRadioOperatorAlive(): boolean {
+    const members = this.app.world.getSquadMembers('player_squad');
+    const radioOp = members.find((m) => m.role === 'radio');
+    return radioOp ? radioOp.alive && radioOp.state !== 'dead' : true;
+  }
+
+  private getStormIntensity(): number {
+    return this.activeMission.environment.hasRain ? 0.65 : 0.1;
+  }
+
+  private handleUiSquadOrder(type: SquadCommandType): void {
+    if (this.screen !== 'playing' || this.player.inAllyTank || this.player.mgMounted || this.player.hp <= 0) {
+      return;
+    }
+    let targetPos: THREE.Vector3;
+    if (type === 'advance' || type === 'flank') {
+      const origin = this.camera.position;
+      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
+      const hit = this.cover.raycastWorld(origin, dir, 65, true);
+      if (hit) {
+        targetPos = hit.point.clone();
+      } else {
+        targetPos = new THREE.Vector3(
+          THREE.MathUtils.clamp(origin.x + dir.x * 24, -44, 44),
+          this.player.pos.y,
+          THREE.MathUtils.clamp(origin.z + dir.z * 24, -72, 48)
+        );
+        targetPos.y = this.terrain.getTerrainHeight(targetPos.x, targetPos.z);
+      }
+    } else {
+      targetPos = this.player.pos.clone();
+    }
+    this.player.squadMenuOpen = false;
+    this.audio.playUiClick();
+    this.issuePlayerSquadOrder(type, targetPos);
+  }
+
+  private issuePlayerSquadOrder(type: SquadCommandType, targetPos?: THREE.Vector3): void {
+    const resolvedTarget = targetPos ?? this.player.pos.clone();
+    this.squadActiveCommand = type;
+
+    this.squadCommands.issueCommand(
+      'player_squad',
+      type,
+      { x: resolvedTarget.x, y: resolvedTarget.y, z: resolvedTarget.z },
+      undefined,
+      this.missionElapsed
+    );
+
+    this.soldiers.setPlayerSquadOrder(type, resolvedTarget, this.player.pos);
+
+    const radioAlive = this.isRadioOperatorAlive();
+    const storm = this.getStormIntensity();
+
+    if (type === 'flank') {
+      this.squadComms.reportFlankOrder('Líder', 'posição inimiga', this.missionElapsed, radioAlive, storm);
+    } else if (type === 'advance') {
+      this.squadComms.sendContextualMessage(
+        'squad',
+        'Líder',
+        'Pelotão, avançar em cunha! Mantenham fogo de supressão!',
+        this.missionElapsed,
+        radioAlive,
+        storm
+      );
+    } else if (type === 'hold') {
+      this.squadComms.sendContextualMessage(
+        'squad',
+        'Líder',
+        'Manter posição e buscar cobertura! Fogo à vontade!',
+        this.missionElapsed,
+        radioAlive,
+        storm
+      );
+    } else if (type === 'regroup') {
+      this.squadComms.sendContextualMessage(
+        'squad',
+        'Líder',
+        'Pelotão, reagrupar na minha posição!',
+        this.missionElapsed,
+        radioAlive,
+        storm
+      );
+    } else {
+      this.squadComms.sendContextualMessage(
+        'squad',
+        'Líder',
+        `Ordem tática: ${this.squadCommands.getCommandLabelPtBr(type)}.`,
+        this.missionElapsed,
+        radioAlive,
+        storm
+      );
     }
   }
 
@@ -526,11 +785,14 @@ export class GameEngine {
     this.player.setLoadout(this.loadout);
     this.player.viewModel.root.visible = true;
 
+    this.initializeSimulationForMission(id, !cfg.isSurvival && id !== 99);
+
     if (cfg.allyTankSpawn) {
       this.spawnAllyTankWithInteractable(cfg.allyTankSpawn.x, cfg.allyTankSpawn.z);
     }
 
     this.soldiers.spawnAllies(cfg.allyCount);
+    this.soldiers.updateAllySquadProfiles(this.app.world);
     this.soldiers.spawnEmplacedGunners(cfg.enemyEmplacements);
 
     this.phaseIndex = 0;
@@ -599,6 +861,8 @@ export class GameEngine {
     this.player.restoreFromCheckpoint(this.checkpointSnapshot, spawnX, spawnZ, spawnYaw);
     this.player.viewModel.root.visible = true;
 
+    this.initializeSimulationForMission(this.selectedMissionId, false);
+
     if (cfg.allyTankSpawn) {
       this.spawnAllyTankWithInteractable(cfg.allyTankSpawn.x, cfg.allyTankSpawn.z);
     }
@@ -612,6 +876,7 @@ export class GameEngine {
     }
 
     this.soldiers.spawnAllies(cfg.allyCount);
+    this.soldiers.updateAllySquadProfiles(this.app.world);
     this.soldiers.spawnEmplacedGunners(cfg.enemyEmplacements);
 
     this.kills = this.checkpointKills;
@@ -728,9 +993,15 @@ export class GameEngine {
     }
   }
 
-  private pushRadioCaption(text: string): void {
+  private pushRadioCaption(
+    text: string,
+    channel: RadioChannel = 'operational',
+    degraded = this.radioDegraded
+  ): void {
     this.radioCaption = text;
     this.radioCaptionTimer = 5.0;
+    this.radioChannel = channel;
+    this.radioDegraded = degraded;
     this.audio.playRadioStatic();
   }
 
@@ -1033,6 +1304,37 @@ export class GameEngine {
       ? `Fase ${this.checkpointPhaseIndex + 1}`
       : null;
 
+    const squadMembers = this.app.world.getSquadMembers('player_squad');
+    const squadSurvivors = squadMembers.filter((m) => m.alive && m.state !== 'dead').length;
+    const squadCasualties = Math.max(0, squadMembers.length - squadSurvivors);
+    const allySectors = this.app.world.sectors.filter((s) => s.owner === 'ally').length;
+    const sectorsCaptured = Math.max(this.sectorsCapturedCount, allySectors);
+    let campaignBonusNote: string | undefined;
+
+    if (!isSurvival) {
+      const survivingSquadIds = squadMembers
+        .filter((m) => m.alive && m.state !== 'dead')
+        .map((m) => m.id);
+      const lostSquadIds = squadMembers
+        .filter((m) => !m.alive || m.state === 'dead')
+        .map((m) => m.id);
+      const nextCampaign = this.campaignManager.recordOperationOutcome(
+        {
+          missionId: this.activeMission.id,
+          victory,
+          durationSec: this.missionElapsed,
+          kills: this.kills,
+          tanksDestroyed: this.tanksDestroyed,
+          secondaryObjectivesDone: sectorsCaptured > 1 ? 1 : 0,
+          survivingSquadIds,
+          lostSquadIds,
+          sectorsCaptured
+        },
+        squadMembers
+      );
+      campaignBonusNote = `Campanha: +${nextCampaign.ammoBonus} munição reserva • Apoio logístico Nv.${nextCampaign.supportLevel}`;
+    }
+
     const summary: MissionEndSummary = {
       missionId: this.activeMission.id,
       missionTitle: isSurvival
@@ -1048,13 +1350,18 @@ export class GameEngine {
       shotsHit: this.player.shotsHit,
       difficulty: this.settings.difficulty,
       canRetryCheckpoint,
-      checkpointPhaseLabel
+      checkpointPhaseLabel,
+      squadSurvivors: squadMembers.length > 0 ? squadSurvivors : undefined,
+      squadCasualties: squadMembers.length > 0 ? squadCasualties : undefined,
+      sectorsCaptured,
+      campaignBonusNote
     };
     this.ui.showMissionEnd(summary);
   }
 
   private updateGameplay(dt: number): void {
     this.missionElapsed += dt;
+    this.medicRadioCooldown = Math.max(0, this.medicRadioCooldown - dt);
     const diffConfig = getDifficultyConfig(this.settings.difficulty);
     const isSurvival = Boolean(this.activeMission.isSurvival || this.activeMission.id === 99);
 
@@ -1185,8 +1492,9 @@ export class GameEngine {
       }
     }
 
-    // Suppress enemies near player gunfire impacts
+    // Report player gunshot sound & suppress enemies near player gunfire impacts
     if (this.player.shotsFired > prevShotsFired) {
+      this.soldiers.reportPlayerSound(this.player.pos, 48);
       const camDir = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion).normalize();
       const impact = this.cover.raycastWorld(this.camera.position, camDir, 75, true);
       if (impact) {
@@ -1194,17 +1502,35 @@ export class GameEngine {
       }
     }
 
-    // Update entities
+    // Update entities & modular tactical simulation
+    this.soldiers.setPlayerMedicalStatus(this.player.hp, this.player.bleeding);
     this.soldiers.update(
       dt,
       this.player.pos,
       this.player.getEyeY(),
       this.player.exposure,
       this.bombers.isWarningOrPassing(),
-      (msg) => this.pushRadioCaption(msg),
+      (msg) => this.pushRadioCaption(msg, 'emergency'),
       this.player.peekDanger,
       diffConfig
     );
+
+    const playerVec3 = { x: this.player.pos.x, y: this.player.pos.y, z: this.player.pos.z };
+    const schedule = this.app.step(dt, {}, playerVec3, dt * 1000);
+    this.squadStepAccumDt += dt;
+    if (schedule.runSquad) {
+      this.squadSystem.update(this.squadStepAccumDt, this.missionElapsed, playerVec3);
+      this.squadStepAccumDt = 0;
+    }
+    this.soldiers.updateAllySquadProfiles(this.app.world);
+
+    const radioAlive = this.isRadioOperatorAlive();
+    const signalQuality = this.squadComms.computeSignalQuality(
+      radioAlive,
+      this.getStormIntensity(),
+      Math.hypot(this.player.pos.x, this.player.pos.z - 40)
+    );
+    this.radioDegraded = signalQuality < 0.45;
 
     this.tanks.update(
       dt,
@@ -1595,6 +1921,19 @@ export class GameEngine {
         this.player.suppression * 0.035) *
       460;
     const allyTankStatus = this.tanks.getAllyTankStatus();
+    const campaignState = this.campaignManager.getState();
+    const rawMembers = this.app.world.getSquadMembers('player_squad');
+    const squadMembers = rawMembers.map((m) => ({
+      id: m.id,
+      callsign: m.callsign,
+      role: m.role,
+      hp: m.health,
+      maxHp: m.maxHealth,
+      alive: m.alive,
+      wounded: m.wounded,
+      state: m.state
+    }));
+    const sectors = this.app.world.getSectorsSnapshot();
 
     const hud: HUDState = {
       hp: this.player.hp,
@@ -1667,7 +2006,16 @@ export class GameEngine {
       allyTankShellCooldown: allyTankStatus.shellCooldown,
       mortarWarning: this.mortarWarningText,
       survivalWave: this.survivalWave,
-      isSurvival
+      isSurvival,
+      squadMenuOpen: this.player.squadMenuOpen,
+      squadActiveCommand: this.squadActiveCommand,
+      squadMembers,
+      sectors,
+      radioChannel: this.radioChannel,
+      radioDegraded: this.radioDegraded,
+      woundLevel: this.player.woundLevel,
+      campaignAmmoBonus: campaignState.ammoBonus,
+      campaignSupportLevel: campaignState.supportLevel
     };
 
     this.ui.updateHUD(hud);

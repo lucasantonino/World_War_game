@@ -1,7 +1,11 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { PerceptionEngine } from '../ai/PerceptionEngine';
+import type { PerceptionState, SimSoldierRole, SquadCommandType, Vec3, WoundLevel } from '../core/types';
 import { AudioEngine } from '../engine/AudioEngine';
 import { getDifficultyConfig } from '../engine/DifficultyConfig';
+import { getFormationOffsets } from '../gameplay/squads/SquadFormation';
+import type { SimulationWorld } from '../simulation/SimulationWorld';
 import { DifficultyModifier, EmplacementSpec, SoldierRole } from '../types';
 import { CoverSystem } from '../world/CoverSystem';
 import { Terrain } from '../world/Terrain';
@@ -16,6 +20,16 @@ const DIRECT_SHOOTER_MAX = 6;
 const REINFORCEMENT_BATCH_SIZE = 12;
 const DEATH_FALL_DURATION = 0.42;
 const CORPSE_RETENTION_SEC = 10.0;
+
+const PLAYER_SQUAD_SLOT_ROLES: readonly SimSoldierRole[] = [
+  'rifleman',
+  'rifleman',
+  'mg_gunner',
+  'antitank',
+  'medic',
+  'grenadier',
+  'radio'
+];
 
 const COLOR_WHITE = new THREE.Color(0xffffff);
 const COLOR_TORSO_GORE = new THREE.Color(0x4a1212);
@@ -211,6 +225,13 @@ export interface Soldier {
   canFocusPlayer: boolean;
   allyTarget: Soldier | null;
   allyRetargetTimer: number;
+
+  squadSlotIndex: number;
+  simRole: SimSoldierRole;
+  observerKey: string;
+  perceivedTargetPos: THREE.Vector3;
+  perceptionState: PerceptionState;
+  perceptionTimer: number;
 }
 
 interface ReinforcementBatch {
@@ -239,6 +260,24 @@ export class SoldierSystem {
   private colorsDirty = false;
   private onSoldierKilled: ((pos: THREE.Vector3, role: SoldierRole, faction: 'ally' | 'enemy') => void) | null = null;
   private onPlayerThermalDamage: ((damage: number, origin: THREE.Vector3) => void) | null = null;
+  private onPlayerHealedByMedic: ((amount: number) => void) | null = null;
+
+  // Modular Perception & Allied Squad integration (zero per-frame allocations)
+  private perception = new PerceptionEngine();
+  private simTimeSec = 0;
+  private perceptionDecayTimer = 0;
+  private lod0ByKey: Map<string, Soldier> = new Map();
+  private tmpVec3: Vec3 = { x: 0, y: 0, z: 0 };
+  private tmpLosEye = new THREE.Vector3();
+  private tmpLosPlayerHead = new THREE.Vector3();
+  private playerSquadOrder: SquadCommandType = 'hold';
+  private playerSquadTarget = new THREE.Vector3();
+  private squadFormationSlots: THREE.Vector3[] = Array.from({ length: 7 }, () => new THREE.Vector3());
+  private allySquadSlots: Array<Soldier | null> = [null, null, null, null, null, null, null];
+  private nextAllySquadSlot = 0;
+  private playerMedicHp = 100;
+  private playerMedicBleeding = false;
+  private allyMedicHealTimer = 0;
 
   // Spatial Grid 2D (CELL_SIZE = 4) with array pooling for zero per-frame allocations
   private spatialGrid: Map<number, Soldier[]> = new Map();
@@ -347,6 +386,165 @@ export class SoldierSystem {
     this.onPlayerThermalDamage = cb;
   }
 
+  public setOnPlayerHealedByMedic(cb: ((amount: number) => void) | null): void {
+    this.onPlayerHealedByMedic = cb;
+  }
+
+  public setPlayerMedicalStatus(hp: number, bleeding: boolean): void {
+    this.playerMedicHp = hp;
+    this.playerMedicBleeding = bleeding;
+  }
+
+  public reportPlayerSound(pos: THREE.Vector3, radius = 48): void {
+    const rSq = radius * radius;
+    this.tmpVec3.x = pos.x;
+    this.tmpVec3.y = pos.y + 1.4;
+    this.tmpVec3.z = pos.z;
+
+    for (let i = 0; i < this.soldiers.length; i++) {
+      const s = this.soldiers[i];
+      if (!s.alive || s.faction !== 'enemy') continue;
+      const dx = s.pos.x - pos.x;
+      const dy = s.pos.y - pos.y;
+      const dz = s.pos.z - pos.z;
+      const dSq = dx * dx + dy * dy + dz * dz;
+      if (dSq <= rSq) {
+        const dist = Math.sqrt(dSq);
+        const strength = Math.max(0.25, 1 - dist / radius);
+        this.perception.reportStimulus(
+          s.observerKey,
+          'player',
+          'ally',
+          this.tmpVec3,
+          'audio',
+          strength,
+          this.simTimeSec
+        );
+        if (s.perceptionState === 'unaware' || s.perceptionState === 'suspicious') {
+          s.perceptionState = strength >= 0.55 ? 'investigating' : 'suspicious';
+          s.perceivedTargetPos.set(pos.x, pos.y + 1.4, pos.z);
+        }
+      }
+    }
+  }
+
+  public setPlayerSquadOrder(
+    order: SquadCommandType,
+    targetPos: THREE.Vector3,
+    playerPos: THREE.Vector3
+  ): void {
+    this.playerSquadOrder = order;
+    this.playerSquadTarget.copy(targetPos);
+
+    const anchorX = order === 'regroup' ? playerPos.x : targetPos.x;
+    const anchorZ = order === 'regroup' ? playerPos.z : targetPos.z;
+    const dx = anchorX - playerPos.x;
+    const dz = anchorZ - playerPos.z;
+    const yaw = Math.hypot(dx, dz) > 0.25 ? Math.atan2(dx, -dz) : 0;
+
+    const offsets = getFormationOffsets(order, 7, yaw);
+    for (let i = 0; i < 7; i++) {
+      const off = offsets[i];
+      if (off) {
+        this.squadFormationSlots[i].set(off.x, off.y, off.z);
+      } else {
+        this.squadFormationSlots[i].set(0, 0, 0);
+      }
+    }
+
+    for (let i = 0; i < 7; i++) {
+      const s = this.allySquadSlots[i];
+      if (!s || !s.alive) continue;
+      if (s.suppressedTimer > 0) continue; // Hierarquia de sobrevivência: suprimido não avança de pé
+
+      if (order === 'hold') {
+        this.cover.releaseTacticalNode(s.id);
+        const node = this.cover.findTacticalCoverNode(s.pos.x, s.pos.z, s.pos.z, 'ally', s.id);
+        if (node && Math.hypot(node.x - s.pos.x, node.z - s.pos.z) > 1.2) {
+          s.coverNodeId = node.id;
+          s.targetPos.set(node.x, node.y, node.z);
+          s.tacticalMode = 'bound';
+          s.isCrouching = false;
+        } else {
+          s.tacticalMode = 'hold_cover';
+          s.isCrouching = true;
+          s.targetPos.copy(s.pos);
+        }
+      } else {
+        const slot = this.squadFormationSlots[i];
+        const gx = THREE.MathUtils.clamp(anchorX + slot.x, -42, 42);
+        const gz = THREE.MathUtils.clamp(anchorZ + slot.z, -68, 44);
+        const gy = this.terrain.getTerrainHeight(gx, gz);
+        this.cover.releaseTacticalNode(s.id);
+        s.coverNodeId = null;
+        s.targetPos.set(gx, gy, gz);
+        s.tacticalMode = 'bound';
+        s.isCrouching = false;
+      }
+    }
+  }
+
+  public updateAllySquadProfiles(world: SimulationWorld): void {
+    const squad = world.squads.get('player_squad') ?? world.getPlayerSquad();
+    if (!squad) return;
+
+    const memberIds = squad.memberIds;
+    const count = Math.min(7, memberIds.length);
+    for (let i = 0; i < count; i++) {
+      const profile = world.soldiers.get(memberIds[i]);
+      const s = this.allySquadSlots[i];
+      if (!profile || !s) continue;
+
+      if (!s.alive) {
+        profile.alive = false;
+        profile.health = 0;
+        profile.wounded = true;
+        profile.woundLevel = 'incapacitated';
+        profile.state = 'dead';
+        continue;
+      }
+
+      profile.alive = true;
+      profile.position.x = s.pos.x;
+      profile.position.y = s.pos.y;
+      profile.position.z = s.pos.z;
+
+      const hpPct = Math.max(0, Math.min(100, Math.round((s.hp / s.maxHp) * 100)));
+      profile.health = hpPct;
+      profile.wounded = hpPct < 80;
+
+      let wound: WoundLevel = 'none';
+      if (hpPct < 35) wound = 'severe';
+      else if (hpPct < 62) wound = 'moderate';
+      else if (hpPct < 82) wound = 'light';
+      profile.woundLevel = wound;
+
+      if (s.suppressedTimer > 0) {
+        profile.state = 'suppressed';
+        profile.suppression = 75;
+      } else if (s.muzzleTimer > 0) {
+        profile.state = 'firing';
+        profile.suppression = Math.max(0, profile.suppression - 4);
+      } else if (s.isMoving) {
+        profile.state = 'moving';
+        profile.suppression = Math.max(0, profile.suppression - 4);
+      } else if (s.tacticalMode === 'hold_cover') {
+        profile.state = 'seeking_cover';
+        profile.suppression = Math.max(0, profile.suppression - 6);
+      } else {
+        profile.state = 'idle';
+        profile.suppression = Math.max(0, profile.suppression - 4);
+      }
+    }
+  }
+
+  private hasVisualLosCallback = (observerId: string, _targetId: string): boolean => {
+    const s = this.lod0ByKey.get(observerId);
+    if (!s || !s.alive) return false;
+    this.tmpLosEye.set(s.pos.x, s.pos.y + (s.isCrouching ? 0.88 : 1.32), s.pos.z);
+    return this.cover.hasLineOfSight(this.tmpLosEye, this.tmpLosPlayerHead);
+  };
+
   public clear(): void {
     for (let i = 0; i < this.soldiers.length; i++) {
       this.cover.releaseTacticalNode(this.soldiers[i].id);
@@ -356,6 +554,20 @@ export class SoldierSystem {
     this.maxSimultaneousEnemies = MAX_SOLDIERS;
     this.lod0Candidates.length = 0;
     this.livingAllies.length = 0;
+    this.lod0ByKey.clear();
+    this.nextAllySquadSlot = 0;
+    for (let i = 0; i < 7; i++) {
+      this.allySquadSlots[i] = null;
+    }
+    this.playerSquadOrder = 'hold';
+    this.simTimeSec = 0;
+    this.perceptionDecayTimer = 0;
+    this.allyMedicHealTimer = 0;
+    for (let i = 0; i < this.soldiers.length; i++) {
+      if (this.soldiers[i].faction === 'enemy') {
+        this.perception.clearObserver(this.soldiers[i].observerKey);
+      }
+    }
     this.colorsDirty = false;
     this.releaseSpatialGrid();
 
@@ -554,6 +766,16 @@ export class SoldierSystem {
       tacticalTimer = 999;
     }
 
+    let squadSlotIndex = -1;
+    let simRole: SimSoldierRole =
+      role === 'mg_gunner' || role === 'grenadier' || role === 'officer' || role === 'assault' || role === 'flamethrower'
+        ? role
+        : 'rifleman';
+    if (faction === 'ally' && !emplaced && this.nextAllySquadSlot < 7) {
+      squadSlotIndex = this.nextAllySquadSlot++;
+      simRole = PLAYER_SQUAD_SLOT_ROLES[squadSlotIndex];
+    }
+
     const soldier: Soldier = {
       id,
       faction,
@@ -597,8 +819,18 @@ export class SoldierSystem {
       isLod0: false,
       canFocusPlayer: false,
       allyTarget: null,
-      allyRetargetTimer: 0
+      allyRetargetTimer: 0,
+      squadSlotIndex,
+      simRole,
+      observerKey: `e_${id}`,
+      perceivedTargetPos: new THREE.Vector3(x, y + 1.2, z),
+      perceptionState: 'unaware',
+      perceptionTimer: Math.random() * 0.25
     };
+
+    if (squadSlotIndex >= 0 && squadSlotIndex < 7) {
+      this.allySquadSlots[squadSlotIndex] = soldier;
+    }
 
     this.soldiers.push(soldier);
     this.insertIntoSpatialGrid(soldier);
@@ -720,6 +952,9 @@ export class SoldierSystem {
     s.alive = false;
     s.deathTimer = 0;
     this.cover.releaseTacticalNode(s.id);
+    if (s.faction === 'enemy') {
+      this.perception.clearObserver(s.observerKey);
+    }
     this.onSoldierKilled?.(s.pos, s.role, s.faction);
 
     // Suppress nearby teammates when someone dies right beside them
@@ -930,10 +1165,16 @@ export class SoldierSystem {
     onPlayerThermalDamage?: (damage: number, origin: THREE.Vector3) => void
   ): void {
     this.frameCounter++;
+    this.simTimeSec += dt;
+    this.perceptionDecayTimer += dt;
+    if (this.allyMedicHealTimer > 0) {
+      this.allyMedicHealTimer = Math.max(0, this.allyMedicHealTimer - dt);
+    }
     this.drainReinforcementQueue();
     this.rebuildSpatialGrid();
 
     this.tmpPlayerHead.set(playerPos.x, playerEyeY, playerPos.z);
+    this.tmpLosPlayerHead.copy(this.tmpPlayerHead);
     const thermalCb = onPlayerThermalDamage ?? this.onPlayerThermalDamage;
 
     // Classify living allies, bounding enemy ratio, & LOD0 enemy candidates (< 32m, capped at 32 closest)
@@ -970,11 +1211,32 @@ export class SoldierSystem {
       this.lod0Candidates.sort((a, b) => a.distToPlayerSq - b.distToPlayerSq);
     }
     const lod0Count = Math.min(LOD0_MAX_ENEMIES, this.lod0Candidates.length);
+    this.lod0ByKey.clear();
     for (let i = 0; i < lod0Count; i++) {
       const candidate = this.lod0Candidates[i];
       candidate.isLod0 = true;
+      this.lod0ByKey.set(candidate.observerKey, candidate);
       if (i < DIRECT_SHOOTER_MAX || (candidate.role === 'flamethrower' && candidate.distToPlayerSq < 20 * 20)) {
         candidate.canFocusPlayer = true;
+      }
+    }
+
+    if (this.perceptionDecayTimer >= 0.25) {
+      this.perceptionDecayTimer = 0;
+      this.perception.decayAll(this.simTimeSec, this.hasVisualLosCallback);
+      for (let i = 0; i < lod0Count; i++) {
+        const candidate = this.lod0Candidates[i];
+        const primary = this.perception.getPrimaryTarget(candidate.observerKey);
+        if (primary) {
+          candidate.perceptionState = primary.state;
+          candidate.perceivedTargetPos.set(
+            primary.lastKnownPosition.x,
+            primary.lastKnownPosition.y,
+            primary.lastKnownPosition.z
+          );
+        } else {
+          candidate.perceptionState = 'unaware';
+        }
       }
     }
 
@@ -1153,8 +1415,70 @@ export class SoldierSystem {
       return;
     }
 
-    // Push forward with the player into No Man's Land houses and low walls
-    if (playerPos.z < 20 && s.tacticalMode !== 'bound') {
+    // Médico aliado (Soldado 05): prioriza socorrer jogador ou aliado ferido próximo
+    let medicBusy = false;
+    if (s.simRole === 'medic' && s.squadSlotIndex >= 0) {
+      const playerNeedsHelp = this.playerMedicHp < 72 || this.playerMedicBleeding;
+      let woundedAlly: Soldier | null = null;
+      if (!playerNeedsHelp) {
+        let bestDistSq = 28 * 28;
+        for (let i = 0; i < this.livingAllies.length; i++) {
+          const other = this.livingAllies[i];
+          if (other.id === s.id || !other.alive) continue;
+          if (other.hp < other.maxHp * 0.72) {
+            const dxA = other.pos.x - s.pos.x;
+            const dzA = other.pos.z - s.pos.z;
+            const dSq = dxA * dxA + dzA * dzA;
+            if (dSq < bestDistSq) {
+              bestDistSq = dSq;
+              woundedAlly = other;
+            }
+          }
+        }
+      }
+
+      if (playerNeedsHelp || woundedAlly) {
+        medicBusy = true;
+        const patientPos = playerNeedsHelp ? playerPos : woundedAlly!.pos;
+        const dxM = patientPos.x - s.pos.x;
+        const dzM = patientPos.z - s.pos.z;
+        const distM = Math.hypot(dxM, dzM);
+        if (distM > 3.6) {
+          s.targetPos.set(patientPos.x, patientPos.y, patientPos.z);
+          s.tacticalMode = 'bound';
+          s.isCrouching = false;
+        } else {
+          s.tacticalMode = 'hold_cover';
+          s.isCrouching = true;
+          s.isMoving = false;
+          s.leftLegRotX = 0;
+          s.rightLegRotX = 0;
+          if (this.allyMedicHealTimer <= 0) {
+            this.allyMedicHealTimer = 2.2;
+            if (playerNeedsHelp) {
+              this.onPlayerHealedByMedic?.(14);
+            } else if (woundedAlly) {
+              woundedAlly.hp = Math.min(woundedAlly.maxHp, woundedAlly.hp + 22);
+            }
+          }
+        }
+      }
+    }
+
+    // Segue ordem tática do pelotão (ou avança com o jogador em campo aberto)
+    if (!medicBusy && s.squadSlotIndex >= 0 && s.squadSlotIndex < 7) {
+      if (this.playerSquadOrder === 'regroup') {
+        const slot = this.squadFormationSlots[s.squadSlotIndex];
+        const gx = THREE.MathUtils.clamp(playerPos.x + slot.x, -42, 42);
+        const gz = THREE.MathUtils.clamp(playerPos.z + slot.z, -68, 44);
+        const distToGoal = Math.hypot(gx - s.pos.x, gz - s.pos.z);
+        if (distToGoal > 3.2) {
+          s.targetPos.set(gx, this.terrain.getTerrainHeight(gx, gz), gz);
+          s.tacticalMode = 'bound';
+          s.isCrouching = false;
+        }
+      }
+    } else if (!medicBusy && playerPos.z < 20 && s.tacticalMode !== 'bound') {
       const desiredGoalZ = Math.max(-45, playerPos.z - 6);
       if (s.pos.z > playerPos.z + 9 || (s.tacticalTimer <= 0 && s.targetPos.z > desiredGoalZ + 8)) {
         this.cover.releaseTacticalNode(s.id);
@@ -1406,6 +1730,29 @@ export class SoldierSystem {
     const canSeePlayer =
       playerExposure >= 0.2 && this.cover.hasLineOfSight(this.tmpEye, playerHead);
 
+    s.perceptionTimer -= dt;
+    if (canSeePlayer) {
+      s.perceivedTargetPos.copy(playerHead);
+      if (s.perceptionState !== 'engaging') {
+        s.perceptionState = 'engaging';
+      }
+      if (s.perceptionTimer <= 0) {
+        s.perceptionTimer = 0.25;
+        this.tmpVec3.x = playerHead.x;
+        this.tmpVec3.y = playerHead.y;
+        this.tmpVec3.z = playerHead.z;
+        this.perception.reportStimulus(
+          s.observerKey,
+          'player',
+          'ally',
+          this.tmpVec3,
+          'visual',
+          Math.min(1, 0.55 + playerExposure * 0.45),
+          this.simTimeSec
+        );
+      }
+    }
+
     // Protected behind cover or pinned down by suppression -> hold fire while ducked
     if (s.tacticalMode === 'suppressed' || s.tacticalMode === 'hold_cover') {
       s.firstShotGrace = 0.35;
@@ -1497,11 +1844,44 @@ export class SoldierSystem {
         this.fireEnemyShot(s, this.tmpEye, this.tmpDir, 0.16 * spreadMult, playerPos.x, distToPlayer);
       }
     } else {
-      if (s.tacticalMode !== 'bound') {
-        s.yaw = Math.PI;
-      }
       s.firstShotGrace = 0.35;
-      this.fireSuppressiveVolley(s, dt, playerPos, playerHead, spreadMult, distToPlayer, false);
+      if (
+        s.perceptionState === 'lost_contact' ||
+        s.perceptionState === 'investigating' ||
+        s.perceptionState === 'suspicious'
+      ) {
+        // Sem LoS direta: dispara com maior dispersão contra a última posição conhecida (não rastreia através de fumaça/paredes!)
+        const dx = s.perceivedTargetPos.x - s.pos.x;
+        const dz = s.perceivedTargetPos.z - s.pos.z;
+        s.yaw = Math.atan2(-dx, -dz);
+        s.fireCooldown -= dt;
+        if (s.fireCooldown <= 0) {
+          s.fireCooldown =
+            s.role === 'mg_gunner' ? 0.24 : s.role === 'assault' ? 0.32 : 1.45 + Math.random() * 0.9;
+          this.tmpTarget.set(
+            s.perceivedTargetPos.x + (Math.random() - 0.5) * 4.2,
+            s.perceivedTargetPos.y + (Math.random() - 0.5) * 1.4,
+            s.perceivedTargetPos.z + (Math.random() - 0.5) * 4.2
+          );
+          this.tmpDir.subVectors(this.tmpTarget, this.tmpEye).normalize();
+          this.fireEnemyShot(
+            s,
+            this.tmpEye,
+            this.tmpDir,
+            0.24 * spreadMult,
+            s.perceivedTargetPos.x,
+            distToPlayer
+          );
+        }
+      } else {
+        if (s.tacticalMode !== 'bound') {
+          s.yaw = Math.PI;
+        }
+        const targetAlly = this.findRandomLivingAlly();
+        if (targetAlly) {
+          this.fireSuppressiveVolley(s, dt, playerPos, playerHead, spreadMult, distToPlayer, false);
+        }
+      }
     }
 
     return startedNewBound;

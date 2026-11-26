@@ -1,4 +1,25 @@
 import * as THREE from 'three';
+import type {
+  BattlefieldSector,
+  RadioChannel,
+  SimSoldierRole,
+  SoldierState,
+  SquadCommandType,
+  VehicleState,
+  VehicleSubsystem,
+  WoundLevel
+} from './core/types';
+
+export type {
+  BattlefieldSector,
+  RadioChannel,
+  SimSoldierRole,
+  SoldierState,
+  SquadCommandType,
+  VehicleState,
+  VehicleSubsystem,
+  WoundLevel
+};
 
 export type WeaponId =
   | 'rifle'
@@ -392,6 +413,24 @@ export interface HUDState {
   mortarWarning: string | null;
   survivalWave: number;
   isSurvival: boolean;
+  squadMenuOpen: boolean;
+  squadActiveCommand: SquadCommandType;
+  squadMembers: Array<{
+    id: string;
+    callsign: string;
+    role: SimSoldierRole;
+    hp: number;
+    maxHp: number;
+    alive: boolean;
+    wounded: boolean;
+    state: SoldierState;
+  }>;
+  sectors: BattlefieldSector[];
+  radioChannel: RadioChannel;
+  radioDegraded: boolean;
+  woundLevel: WoundLevel;
+  campaignAmmoBonus: number;
+  campaignSupportLevel: number;
 }
 
 export interface SurvivalRecord {
@@ -430,4 +469,8 @@ export interface MissionEndSummary {
   difficulty: DifficultyLevel;
   canRetryCheckpoint: boolean;
   checkpointPhaseLabel: string | null;
+  squadSurvivors?: number;
+  squadCasualties?: number;
+  sectorsCaptured?: number;
+  campaignBonusNote?: string;
 }

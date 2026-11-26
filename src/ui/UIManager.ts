@@ -8,7 +8,10 @@ import {
   MissionId,
   PlayerLoadout,
   PrimaryWeaponId,
+  RadioChannel,
   SecondaryWeaponId,
+  SimSoldierRole,
+  SquadCommandType,
   SurvivalRecord,
   TouchControlMode,
   WeaponId
@@ -62,6 +65,32 @@ const SHORT_WEAPON_NAMES: Record<WeaponId, string> = {
   grenade: 'Granada'
 };
 
+const RADIO_CHANNEL_LABELS: Record<RadioChannel, string> = {
+  command: 'COMANDO',
+  squad: 'PELOTÃO',
+  operational: 'OPERACIONAL',
+  emergency: 'EMERGÊNCIA'
+};
+
+const SQUAD_ORDER_LABELS: Partial<Record<SquadCommandType, string>> = {
+  advance: 'AVANÇAR',
+  hold: 'MANTER',
+  flank: 'FLANQUEAR',
+  regroup: 'REAGRUPAR'
+};
+
+const ROLE_SHORT_LABELS: Record<SimSoldierRole, string> = {
+  rifleman: 'FUZ',
+  mg_gunner: 'MG',
+  antitank: 'AT',
+  medic: 'MED',
+  grenadier: 'GRN',
+  radio: 'RAD',
+  assault: 'ASS',
+  officer: 'OF',
+  flamethrower: 'CHM'
+};
+
 const PRIMARY_OPTIONS: Array<{ id: PrimaryWeaponId; label: string; unlockHint: string }> = [
   { id: 'rifle', label: 'Fuzil M-42', unlockHint: 'Padrão' },
   { id: 'smg', label: 'SMG-44', unlockHint: 'Padrão' },
@@ -80,6 +109,8 @@ export class UIManager {
   public onTouchSmoke: (() => void) | null = null;
   public onTouchMelee: (() => void) | null = null;
   public onTouchBinoculars: (() => void) | null = null;
+  public onIssueSquadOrder: ((type: SquadCommandType) => void) | null = null;
+  public onToggleSquadMenu: (() => void) | null = null;
 
   private root: HTMLElement;
   private callbacks: UICallbacks;
@@ -160,6 +191,13 @@ export class UIManager {
   private touchBtnGrenade!: HTMLElement;
   private touchBtnWeapon!: HTMLElement;
   private touchBtnFire!: HTMLElement;
+  private touchBtnSquad!: HTMLElement;
+  private sectorsBarEl!: HTMLElement;
+  private squadRosterEl!: HTMLElement;
+  private squadMenuEl!: HTMLElement;
+  private squadOrderBtns: HTMLButtonElement[] = [];
+  private lastSectorsKey = '';
+  private lastSquadRosterKey = '';
   private goreWarningBannerEl!: HTMLElement;
   private orientationWarnEl!: HTMLElement;
   private dismissedPortraitWarning = false;
@@ -278,6 +316,32 @@ export class UIManager {
     this.endEl.querySelector('#stat-tanks')!.textContent = String(summary.tanksDestroyed);
     this.endEl.querySelector('#stat-acc')!.textContent = `${acc}%`;
 
+    const squadSummaryEl = this.endEl.querySelector('#end-squad-summary') as HTMLElement;
+    const hasSquadData =
+      summary.squadSurvivors !== undefined ||
+      summary.sectorsCaptured !== undefined ||
+      Boolean(summary.campaignBonusNote);
+    if (hasSquadData) {
+      const parts: string[] = [];
+      if (summary.squadSurvivors !== undefined) {
+        parts.push(`PELOTÃO: ${summary.squadSurvivors} sobrevivente(s)`);
+      }
+      if (summary.squadCasualties !== undefined) {
+        parts.push(`${summary.squadCasualties} baixa(s)`);
+      }
+      if (summary.sectorsCaptured !== undefined) {
+        parts.push(`SETORES: ${summary.sectorsCaptured}/5`);
+      }
+      const line1 = parts.join(' • ');
+      const line2 = summary.campaignBonusNote
+        ? `<div class="end-campaign-note">${summary.campaignBonusNote}</div>`
+        : '';
+      squadSummaryEl.innerHTML = `<div>${line1}</div>${line2}`;
+      squadSummaryEl.classList.remove('hidden');
+    } else {
+      squadSummaryEl.classList.add('hidden');
+    }
+
     this.setScreen(summary.victory ? 'victory' : 'kia');
   }
 
@@ -370,10 +434,75 @@ export class UIManager {
     }
 
     if (state.radioCaption) {
-      this.radioEl.textContent = `RÁDIO ALIADO: "${state.radioCaption}"`;
+      const chLabel = RADIO_CHANNEL_LABELS[state.radioChannel] ?? 'OPERACIONAL';
+      const degradedTag = state.radioDegraded ? ' • SINAL DEGRADADO' : '';
+      this.radioEl.textContent = `[${chLabel}] "${state.radioCaption}"${degradedTag}`;
+      this.radioEl.classList.toggle('degraded', state.radioDegraded);
       this.radioEl.classList.remove('hidden');
     } else {
       this.radioEl.classList.add('hidden');
+    }
+
+    // 4b. Sectors Bar (A B C D E)
+    if (state.sectors && state.sectors.length > 0) {
+      const sectorsKey = state.sectors
+        .map((s) => `${s.code}:${s.owner}:${s.contested ? 1 : 0}`)
+        .join('|');
+      if (sectorsKey !== this.lastSectorsKey) {
+        this.lastSectorsKey = sectorsKey;
+        this.sectorsBarEl.innerHTML = state.sectors
+          .map((s) => {
+            const ownerCls = s.contested
+              ? 'contested'
+              : s.owner === 'ally'
+                ? 'ally'
+                : s.owner === 'enemy'
+                  ? 'enemy'
+                  : 'neutral';
+            return `<span class="sector-pill ${ownerCls}" title="${s.name}">${s.code}</span>`;
+          })
+          .join('');
+      }
+      this.sectorsBarEl.classList.remove('hidden');
+    } else {
+      this.sectorsBarEl.classList.add('hidden');
+    }
+
+    // 4c. Squad Roster & Quick Order Menu
+    if (state.squadMembers && state.squadMembers.length > 0) {
+      const orderLabel = SQUAD_ORDER_LABELS[state.squadActiveCommand] ?? 'MANTER';
+      const rosterKey =
+        orderLabel +
+        '|' +
+        state.squadMembers
+          .map((m) => `${m.id}:${m.alive ? 1 : 0}:${m.wounded ? 1 : 0}:${Math.round(m.hp)}`)
+          .join(',');
+      if (rosterKey !== this.lastSquadRosterKey) {
+        this.lastSquadRosterKey = rosterKey;
+        const chipsHtml = state.squadMembers
+          .slice(0, 7)
+          .map((m, idx) => {
+            const cls = !m.alive ? 'dead' : m.wounded || m.hp < 70 ? 'wounded' : 'alive';
+            const roleTag = ROLE_SHORT_LABELS[m.role] ?? 'INF';
+            return `<span class="squad-member-chip ${cls}" title="${m.callsign} (${Math.round(m.hp)}%)"><span class="sq-idx">${idx + 1}</span><span class="sq-role">${roleTag}</span></span>`;
+          })
+          .join('');
+        this.squadRosterEl.innerHTML = `
+          <div class="squad-roster-head">
+            <span class="squad-roster-title">PELOTÃO [Z]</span>
+            <span class="squad-order-badge">${orderLabel}</span>
+          </div>
+          <div class="squad-roster-chips">${chipsHtml}</div>
+        `;
+      }
+      this.squadRosterEl.classList.remove('hidden');
+    } else {
+      this.squadRosterEl.classList.add('hidden');
+    }
+
+    this.squadMenuEl.classList.toggle('hidden', !state.squadMenuOpen);
+    for (const btn of this.squadOrderBtns) {
+      btn.classList.toggle('active', btn.dataset.squadOrder === state.squadActiveCommand);
     }
 
     // 5. Special Optical & Vehicle Overlays
@@ -578,6 +707,8 @@ export class UIManager {
     this.touchBtnGrenade.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
     this.touchBtnSmoke.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
     this.touchBtnWeapon.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnSquad.classList.toggle('hidden', state.inAllyTank || state.mgMounted);
+    this.touchBtnSquad.classList.toggle('active', state.squadMenuOpen);
 
     this.touchBtnFire.textContent = state.inAllyTank
       ? 'CANHÃO'
@@ -764,6 +895,7 @@ export class UIManager {
             <div class="control-pair"><span>Baioneta / Binóculo</span><span><kbd>V</kbd> <kbd>B</kbd></span></div>
             <div class="control-pair"><span>Frag / Fumaça</span><span><kbd>G</kbd> <kbd>X</kbd></span></div>
             <div class="control-pair"><span>Curativo / Interagir</span><span><kbd>H</kbd> <kbd>F</kbd></span></div>
+            <div class="control-pair"><span>Ordens do Pelotão</span><span><kbd>Z</kbd> <kbd>1-4</kbd></span></div>
           </div>
           <div class="cta-row" style="justify-content:space-between">
             <div style="display:flex;gap:10px">
@@ -790,6 +922,7 @@ export class UIManager {
             <div class="stat-cell"><div class="stat-label">Blindados</div><div id="stat-tanks" class="stat-value">0</div></div>
             <div class="stat-cell"><div class="stat-label">Precisão</div><div id="stat-acc" class="stat-value">0%</div></div>
           </div>
+          <div id="end-squad-summary" class="end-squad-summary hidden"></div>
           <div class="cta-row" style="justify-content:space-between">
             <button id="btn-end-menu" class="btn-secondary">Voltar ao QG</button>
             <div style="display:flex;gap:10px">
@@ -843,7 +976,7 @@ export class UIManager {
 
         <div id="controls-toast" class="controls-toast">
           [WASD] Mover • [C] Agachar • [Q/E] Espiar • [V] Baioneta • [B] Binóculo<br />
-          [1-5] Armas • [G] Frag • [X] Fumaça • [H] Curativo • [F] Interagir
+          [1-5] Armas • [G] Frag • [X] Fumaça • [H] Curativo • [Z] Pelotão • [F] Interagir
         </div>
 
         <div class="hud-top">
@@ -858,6 +991,7 @@ export class UIManager {
             <div id="hud-obj-sub" class="objective-sub">...</div>
             <div id="hud-swarm-count" class="objective-swarm-meta hidden"></div>
           </div>
+          <div id="hud-sectors-bar" class="sectors-bar hidden"></div>
           <div id="hud-checkpoint-toast" class="checkpoint-toast hidden"></div>
           <div id="hud-air-raid" class="air-raid-banner hidden">ALERTA AÉREO</div>
           <div id="hud-mortar-warning" class="mortar-warning hidden">MORTEIRO CALIBRADO — MOVA-SE!</div>
@@ -881,6 +1015,7 @@ export class UIManager {
         <div id="hud-interact" class="interact-prompt hidden"></div>
 
         <div class="hud-bottom-left">
+          <div id="hud-squad-roster" class="squad-roster hidden"></div>
           <div id="hud-cover-pill" class="cover-pill sheltered">
             <span class="cover-dot"></span>
             <span id="hud-cover-text" class="cover-text">EM COBERTURA</span>
@@ -921,6 +1056,19 @@ export class UIManager {
           </div>
         </div>
 
+        <div id="squad-command-menu" class="squad-command-menu hidden">
+          <div class="squad-menu-header">
+            <span>ORDENS DO PELOTÃO</span>
+            <button id="btn-squad-menu-close" type="button" class="squad-menu-close">[Z] Fechar</button>
+          </div>
+          <div class="squad-menu-actions">
+            <button type="button" class="squad-order-btn" data-squad-order="advance">[1] AVANÇAR</button>
+            <button type="button" class="squad-order-btn" data-squad-order="hold">[2] MANTER POSIÇÃO</button>
+            <button type="button" class="squad-order-btn" data-squad-order="flank">[3] FLANQUEAR</button>
+            <button type="button" class="squad-order-btn" data-squad-order="regroup">[4] REAGRUPAR</button>
+          </div>
+        </div>
+
         <!-- MOBILE TOUCH CONTROLS -->
         <div id="touch-controls" class="touch-controls hidden">
           <div id="touch-look-zone" class="touch-look-zone"></div>
@@ -937,6 +1085,7 @@ export class UIManager {
             <button id="touch-btn-crouch" type="button" class="touch-btn">AGACHAR</button>
             <button id="touch-btn-jump" type="button" class="touch-btn">ESCALAR</button>
             <button id="touch-btn-heal" type="button" class="touch-btn">CURATIVO</button>
+            <button id="touch-btn-squad" type="button" class="touch-btn">PELOTÃO</button>
           </div>
 
           <button id="touch-btn-interact" type="button" class="touch-btn touch-btn-interact hidden">
@@ -1032,6 +1181,11 @@ export class UIManager {
     this.touchBtnGrenade = this.root.querySelector('#touch-btn-grenade')!;
     this.touchBtnWeapon = this.root.querySelector('#touch-btn-weapon')!;
     this.touchBtnFire = this.root.querySelector('#touch-btn-fire')!;
+    this.touchBtnSquad = this.root.querySelector('#touch-btn-squad')!;
+    this.sectorsBarEl = this.root.querySelector('#hud-sectors-bar')!;
+    this.squadRosterEl = this.root.querySelector('#hud-squad-roster')!;
+    this.squadMenuEl = this.root.querySelector('#squad-command-menu')!;
+    this.squadOrderBtns = Array.from(this.root.querySelectorAll('.squad-order-btn')) as HTMLButtonElement[];
     this.goreWarningBannerEl = this.root.querySelector('#gore-warning-banner')!;
     this.orientationWarnEl = this.root.querySelector('#orientation-warning')!;
     this.opsHeadingCountEl = this.root.querySelector('#ops-heading-count')!;
@@ -1303,6 +1457,24 @@ export class UIManager {
         }
       });
     }
+
+    for (const btn of this.squadOrderBtns) {
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const order = btn.dataset.squadOrder as SquadCommandType | undefined;
+        if (order) {
+          this.onIssueSquadOrder?.(order);
+        }
+      });
+    }
+
+    const squadCloseBtn = this.root.querySelector('#btn-squad-menu-close');
+    squadCloseBtn?.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.onToggleSquadMenu?.();
+    });
   }
 
   private bindTouchControls(): void {
@@ -1467,6 +1639,10 @@ export class UIManager {
     bindTapButton('#touch-btn-crouch', () => this.callbacks.onTouchKeyPress('KeyC'));
     bindHoldButton('#touch-btn-jump', 'Space');
     bindTapButton('#touch-btn-heal', () => this.callbacks.onTouchKeyPress('KeyH'));
+    bindTapButton('#touch-btn-squad', () => {
+      if (this.onToggleSquadMenu) this.onToggleSquadMenu();
+      else this.callbacks.onTouchKeyPress('KeyZ');
+    });
     bindTapButton('#touch-btn-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
     bindTapButton('#hud-interact', () => this.callbacks.onTouchKeyPress('KeyF'));
     bindTapButton('#bino-telemetry', () => {
